@@ -1,0 +1,43 @@
+# data is never committed - it lives on D: and is reproducible from the ingest scripts.
+# data_synth* are generated fixtures; regenerate with scripts/make_synthetic_data.py
+data/
+data_synth*/
+!data/.gitkeep
+
+# locally cached wheels (see scripts/fetch_wheels.ps1) - ~64MB, reproducible
+.wheels/
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# secrets
+.env
+*.pem
+kaggle.json
+
+# mlflow / artifacts
+mlruns/
+mlartifacts/
+reports/figures/*.png
+!reports/figures/.gitkeep
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# airflow
+dags/__pycache__/
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# os
+Thumbs.db
+.DS_Store

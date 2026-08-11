@@ -1,0 +1,141 @@
+# Local platform stack.
+#
+# Default `docker compose up -d` starts only the two lightweight services the
+# pipeline actually needs (Postgres + Redis, ~300MB of images). Everything
+# heavier sits behind a profile because this machine has limited free space on
+# C:, where Docker Desktop keeps its WSL disk image.
+#
+#   docker compose up -d                        # postgres + redis
+#   docker compose --profile tools   up -d      # + adminer (DB browser)
+#   docker compose --profile mlflow  up -d      # + MLflow tracking server
+#   docker compose --profile kafka   up -d      # + Kafka, swapping out Redis Streams
+#
+# Postgres is on 5433, not 5432, to avoid colliding with any local install.
+
+name: ecommerce-ml-platform
+
+services:
+  postgres:
+    # postgres:16 (not -alpine) because that tag is already present locally and
+    # this machine has ~100 KB/s of bandwidth; pulling a new image costs an hour.
+    image: postgres:16
+    container_name: emp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-storefront}
+      POSTGRES_USER: ${POSTGRES_USER:-storefront}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-storefront_local}
+      # deterministic collation so ORDER BY matches DuckDB's
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    # Tuned for a write-heavy replay on a 16GB laptop. synchronous_commit=off
+    # trades crash durability for throughput, which is the right call here:
+    # the archive is the source of truth and a replay can simply be re-run.
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c work_mem=32MB
+      -c maintenance_work_mem=256MB
+      -c max_connections=50
+      -c synchronous_commit=off
+      -c wal_compression=on
+      -c checkpoint_timeout=15min
+      -c max_wal_size=2GB
+      -c random_page_cost=1.1
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-storefront} -d ${POSTGRES_DB:-storefront}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    # likewise already present locally
+    image: redis:latest
+    container_name: emp-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    # Event bus + online feature store. maxmemory caps the stream so a long
+    # replay cannot consume the host; allkeys-lru evicts cold feature keys.
+    command: >
+      redis-server
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --save ""
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  adminer:
+    image: adminer:4-standalone
+    container_name: emp-adminer
+    restart: unless-stopped
+    profiles: ["tools"]
+    ports:
+      - "8081:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.19.0
+    container_name: emp-mlflow
+    restart: unless-stopped
+    profiles: ["mlflow"]
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-storefront}:${POSTGRES_PASSWORD:-storefront_local}@postgres:5432/${POSTGRES_DB:-storefront}
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlartifacts
+    # psycopg2 is not in the base image; install it before the server starts.
+    command: >
+      bash -c "pip install --no-cache-dir psycopg2-binary &&
+               mlflow server
+                 --host 0.0.0.0 --port 5000
+                 --backend-store-uri $$MLFLOW_BACKEND_STORE_URI
+                 --default-artifact-root $$MLFLOW_DEFAULT_ARTIFACT_ROOT"
+    volumes:
+      - mlartifacts:/mlartifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  kafka:
+    image: bitnami/kafka:3.9
+    container_name: emp-kafka
+    restart: unless-stopped
+    profiles: ["kafka"]
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode - no ZooKeeper, single combined broker/controller node
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_NUM_PARTITIONS: "6"
+      KAFKA_CFG_LOG_RETENTION_HOURS: "24"
+    volumes:
+      - kafkadata:/bitnami/kafka
+
+volumes:
+  pgdata:
+  redisdata:
+  mlartifacts:
+  kafkadata:

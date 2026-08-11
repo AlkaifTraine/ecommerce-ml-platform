@@ -1,0 +1,39 @@
+# Python 3.13 on the dev machine.
+#
+# NOTE ON VERSIONS: this machine has ~100 KB/s throughput to PyPI, so the venv
+# is created with `--system-site-packages` to inherit heavy wheels that are
+# already installed system-wide (numpy, pandas, pyarrow, scipy, scikit-learn,
+# lightgbm, matplotlib, fastapi, sqlalchemy, redis). Version floors below match
+# what is actually in use rather than pinning to something we cannot download.
+#
+# Reproduce elsewhere with:  pip install -r requirements.txt
+
+# ---- inherited from system site-packages on the dev box ----
+numpy>=2.2
+pandas>=2.2
+pyarrow>=18
+scipy>=1.14
+scikit-learn>=1.5
+lightgbm>=4.5
+matplotlib>=3.9
+fastapi>=0.115
+uvicorn>=0.34
+pydantic>=2.10
+pydantic-settings>=2.7
+sqlalchemy>=2.0
+redis>=4.6
+
+# ---- installed directly into the venv ----
+polars>=1.17
+duckdb>=1.1
+pytest>=8.0
+python-dotenv>=1.0
+rich>=13.9
+kaggle>=1.6
+
+# ---- deferred until the tracking/registry stage (heavy dependency tree) ----
+# mlflow>=2.19
+
+# ---- Postgres driver ----
+# psycopg2 (2.9.x) is already present system-wide and is what the code targets.
+# psycopg[binary] v3 is NOT required.
