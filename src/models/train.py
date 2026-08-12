@@ -53,7 +53,13 @@ def chronological_split(
     if n < 4:
         raise SystemExit(f"need at least 4 distinct dates to split, got {n}")
 
-    i1, i2, i3 = (max(1, int(round(n * b))) for b in bounds)
+    # Clamp so the four windows are strictly ordered and none is empty. With a
+    # small date range (the committed test fixture spans four days) the raw
+    # fractions collapse onto the same index and would run off the end.
+    i1, i2, i3 = (int(round(n * b)) for b in bounds)
+    i1 = min(max(i1, 1), n - 3)
+    i2 = min(max(i2, i1 + 1), n - 2)
+    i3 = min(max(i3, i2 + 1), n - 1)
     cuts = {
         "train": (dates[0], dates[i1 - 1]),
         "valid": (dates[i1], dates[i2 - 1]),

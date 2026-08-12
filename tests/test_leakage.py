@@ -20,8 +20,8 @@ def test_audit_passes_on_handmade(handmade_pipeline):
     assert res.passed, f"leakage audit failed:\n{res.report()}"
 
 
-def test_audit_passes_on_synthetic(synthetic_pipeline):
-    res = audit(synthetic_pipeline, k=K)
+def test_audit_passes_on_real_slice(real_pipeline):
+    res = audit(real_pipeline, k=K)
     assert res.passed, f"leakage audit failed:\n{res.report()}"
 
 
@@ -32,12 +32,12 @@ def test_every_check_actually_ran(handmade_pipeline):
     assert expected.issubset(res.checks.keys()), f"missing checks: {expected - set(res.checks)}"
 
 
-def test_audit_has_teeth(synthetic_pipeline, tmp_path):
+def test_audit_has_teeth(real_pipeline, tmp_path):
     """Flip a single label and confirm the audit notices.
 
     This is the control experiment for the whole suite.
     """
-    path = synthetic_pipeline.features_dir / f"train_k{K}.parquet"
+    path = real_pipeline.features_dir / f"train_k{K}.parquet"
     original = pl.read_parquet(path)
     backup = tmp_path / "backup.parquet"
     original.write_parquet(backup)
@@ -51,7 +51,7 @@ def test_audit_has_teeth(synthetic_pipeline, tmp_path):
         )
         corrupted.write_parquet(path)
 
-        res = audit(synthetic_pipeline, k=K)
+        res = audit(real_pipeline, k=K)
         assert not res.passed, "audit passed on deliberately corrupted labels - it has no teeth"
         assert res.checks["label_provenance"] > 0, (
             f"expected label_provenance to fire, got: {res.checks}"
@@ -60,34 +60,35 @@ def test_audit_has_teeth(synthetic_pipeline, tmp_path):
         pl.read_parquet(backup).write_parquet(path)
 
     # and it must go back to passing once restored
-    assert audit(synthetic_pipeline, k=K).passed
+    assert audit(real_pipeline, k=K).passed
 
 
-def test_clock_bound_is_enforced(synthetic_pipeline):
+def test_clock_bound_is_enforced(real_pipeline):
     """Rebuild with a clock cutoff; nothing at or after it may appear."""
     from src.features import build_features, sessionize
 
-    cutoff = "2019-10-10T00:00:00"
-    sessionize.build(synthetic_pipeline, until=cutoff)
-    build_features.build(synthetic_pipeline, k=K, until=cutoff)
+    # must fall inside the fixture's own date range, else the build is empty
+    cutoff = "2019-11-07T00:00:00"
+    sessionize.build(real_pipeline, until=cutoff)
+    build_features.build(real_pipeline, k=K, until=cutoff)
 
-    res = audit(synthetic_pipeline, k=K, until=cutoff)
+    res = audit(real_pipeline, k=K, until=cutoff)
     assert res.checks.get("no_future_events") == 0, f"clock breach:\n{res.report()}"
 
-    df = pl.read_parquet(synthetic_pipeline.features_dir / f"train_k{K}.parquet")
+    df = pl.read_parquet(real_pipeline.features_dir / f"train_k{K}.parquet")
     assert df.height > 0, "clock-bounded build produced nothing to test"
     latest = df["cutoff_time"].max()
     assert str(latest) < cutoff.replace("T", " "), f"row at {latest} is beyond the clock"
 
     # restore the unbounded build for any later test
-    sessionize.build(synthetic_pipeline)
-    build_features.build(synthetic_pipeline, k=K)
+    sessionize.build(real_pipeline)
+    build_features.build(real_pipeline, k=K)
 
 
-def test_split_windows_do_not_overlap(synthetic_pipeline):
+def test_split_windows_do_not_overlap(real_pipeline):
     from src.models.train import chronological_split
 
-    df = pl.read_parquet(synthetic_pipeline.features_dir / f"train_k{K}.parquet")
+    df = pl.read_parquet(real_pipeline.features_dir / f"train_k{K}.parquet")
     splits = chronological_split(df)
     res = audit_splits(splits)
     assert res.passed, f"split windows overlap:\n{res.report()}"
@@ -98,10 +99,10 @@ def test_split_windows_do_not_overlap(synthetic_pipeline):
         assert splits[a]["session_date"].max() < splits[b]["session_date"].min()
 
 
-def test_identifiers_never_reach_the_model(synthetic_pipeline):
+def test_identifiers_never_reach_the_model(real_pipeline):
     from src.models.train import ID_COLS, LABEL, feature_columns
 
-    df = pl.read_parquet(synthetic_pipeline.features_dir / f"train_k{K}.parquet")
+    df = pl.read_parquet(real_pipeline.features_dir / f"train_k{K}.parquet")
     feats = feature_columns(df)
     for banned in ID_COLS + [LABEL]:
         assert banned not in feats, f"{banned} reached the feature matrix"

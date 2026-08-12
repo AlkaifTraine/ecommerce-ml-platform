@@ -92,10 +92,50 @@ def test_no_nulls_in_core_features(train):
     assert not nulls, f"unexpected nulls: {nulls}"
 
 
-def test_synthetic_positive_rate_is_plausible(synthetic_pipeline):
-    """Sanity-check the generator: the task must be neither trivial nor empty."""
-    path = synthetic_pipeline.features_dir / f"train_k{K}.parquet"
+def test_feature_build_is_deterministic(real_pipeline):
+    """Rebuilding must produce byte-identical labels and features.
+
+    Regression test for a real bug: the event ordering key was
+    (event_time, product_id), which is NOT unique - timestamps are
+    second-granular and ~0.2% of rows are exact duplicates. row_number() over a
+    tied key is arbitrary, so successive runs ranked boundary events
+    differently and the training set silently changed between builds. The
+    leakage audit caught it as one no_prepurchase violation in 5,153,372
+    sessions.
+    """
+    from src.features import build_features
+
+    path = real_pipeline.features_dir / f"train_k{K}.parquet"
+    first = pl.read_parquet(path).sort("session_key")
+
+    build_features.build(real_pipeline, k=K)
+    second = pl.read_parquet(path).sort("session_key")
+
+    assert first.height == second.height, (
+        f"row count changed between builds: {first.height} -> {second.height}"
+    )
+    assert first["session_key"].to_list() == second["session_key"].to_list(), (
+        "the set of eligible sessions changed between identical builds"
+    )
+    assert first["y"].to_list() == second["y"].to_list(), (
+        "labels changed between identical builds - event ordering is not total"
+    )
+    for col in ("n_distinct_products", "max_views_same_product", "price_at_cutoff",
+                "cutoff_time", "n_cart_events"):
+        assert first[col].to_list() == second[col].to_list(), (
+            f"feature {col} changed between identical builds"
+        )
+
+
+def test_real_slice_positive_rate_is_plausible(real_pipeline):
+    """The real fixture must land near the archive-wide base rate.
+
+    Measured on the full archive: 6.10% of sessions purchase, and ~7.0% of
+    k=5-eligible sessions do. A fixture far outside that band means the slice
+    is unrepresentative and any test built on it is misleading.
+    """
+    path = real_pipeline.features_dir / f"train_k{K}.parquet"
     df = pl.read_parquet(path)
     assert df.height > 500, f"too few eligible sessions to test with: {df.height}"
     rate = float(df["y"].mean())
-    assert 0.01 < rate < 0.80, f"implausible positive rate {rate:.3f}"
+    assert 0.02 < rate < 0.20, f"positive rate {rate:.4f} is far from the archive's ~7%"

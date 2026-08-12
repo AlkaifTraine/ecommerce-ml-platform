@@ -56,6 +56,20 @@ class Settings(BaseSettings):
     # the provider's user_session column.
     session_gap_minutes: int = 30
 
+    # Days excluded from training and evaluation because the source pipeline
+    # failed, not because shoppers behaved differently. Surfaced by
+    # scripts/data_quality_audit.py and confirmed by review:
+    #   2019-11-15  zero purchase events recorded all day
+    #   2019-11-16  4.1x normal volume, buy/cart half the local norm
+    #   2019-11-17  4.2x normal volume, buy/cart inflated by the backlog flush
+    #   2019-11-14  2.0x volume and buy/cart 13% vs ~33% either side - the
+    #               leading edge of the same incident
+    # Sessions with ANY event on these days are dropped: a session straddling
+    # the outage has an unknowable label.
+    quarantine_dates: tuple[str, ...] = (
+        "2019-11-14", "2019-11-15", "2019-11-16", "2019-11-17",
+    )
+
     # ---- derived paths ----
     @property
     def raw_dir(self) -> Path:

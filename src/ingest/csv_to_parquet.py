@@ -117,10 +117,24 @@ def convert(csv_path: Path, out_dir: Path, settings, delete_source: bool = False
         """
     )
 
-    rows = con.execute(
+    # Count ONLY the partitions this file produced, via its FILENAME_PATTERN
+    # stem. Counting every parquet under out_dir would include earlier files
+    # and could "verify" a conversion that actually wrote nothing - not a
+    # sound basis for deleting a multi-gigabyte source.
+    written = con.execute(
+        f"SELECT count(*) FROM read_parquet('{out_dir.as_posix()}/**/{csv_path.stem}_*.parquet')"
+    ).fetchone()[0]
+    total = con.execute(
         f"SELECT count(*) FROM read_parquet('{out_dir.as_posix()}/**/*.parquet')"
     ).fetchone()[0]
-    log.info("%s: parquet now holds %s rows total", csv_path.name, f"{rows:,}")
+    log.info("%s: wrote %s rows (parquet total now %s)",
+             csv_path.name, f"{written:,}", f"{total:,}")
+
+    if written == 0:
+        raise SystemExit(
+            f"{csv_path.name}: conversion produced 0 rows - refusing to continue. "
+            "Source file left untouched."
+        )
 
     if delete_source:
         size_gb = csv_path.stat().st_size / 1e9
@@ -128,7 +142,7 @@ def convert(csv_path: Path, out_dir: Path, settings, delete_source: bool = False
         log.info("deleted source %s, reclaimed %.2f GB", csv_path.name, size_gb)
 
     con.close()
-    return rows
+    return written
 
 
 def main() -> None:

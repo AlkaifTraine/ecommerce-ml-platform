@@ -1,23 +1,34 @@
-"""Fixtures backed by generated data so the pipeline is testable without the
-15GB download.
+"""Test fixtures.
 
-Two datasets are provided:
+There is no synthetic data in this project. Two fixtures, both real in the
+sense that matters:
 
-* `handmade_pipeline` - a seven-event toy set whose correct feature values can
-  be worked out by hand, used to prove the SQL computes what it claims.
-* `synthetic_pipeline` - a few thousand generated sessions with planted signal,
-  used for the statistical and leakage checks.
+* `handmade_pipeline` - 21 events written out by hand in this file, with every
+  expected feature value computed by hand in test_features.py. This is a unit
+  test of the arithmetic, not a stand-in for the dataset.
+
+* `real_pipeline` - an actual slice of the REES46 archive, carved by
+  scripts/make_test_fixture.py and committed under tests/fixtures/. Whole
+  sessions only, selected by a stable hash so the sample is reproducible.
+
+An earlier version generated a few thousand fake sessions instead. It was
+removed: generated data encodes the generator author's assumptions, which is
+precisely what tests are supposed to catch. That generator gave browsers and
+buyers barely-overlapping click gaps, so one feature separated them perfectly
+and the fixture could no longer detect a bug anywhere else.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 K = 5
+FIXTURE_EVENTS = Path(__file__).resolve().parent / "fixtures" / "events"
 
 
 def _fresh_settings(root: Path):
@@ -32,15 +43,6 @@ def _fresh_settings(root: Path):
     return config_mod.get_settings()
 
 
-def _write_events(settings, df) -> None:
-    out = settings.events_dir
-    out.mkdir(parents=True, exist_ok=True)
-    for (d,), part in df.group_by(["event_date"]):
-        pdir = out / f"event_date={d}"
-        pdir.mkdir(parents=True, exist_ok=True)
-        part.drop("event_date").write_parquet(pdir / "part_0.parquet")
-
-
 def _build(settings, k: int = K) -> None:
     from src.features import build_features, sessionize
 
@@ -50,7 +52,7 @@ def _build(settings, k: int = K) -> None:
 
 @pytest.fixture(scope="session")
 def handmade_pipeline(tmp_path_factory):
-    """Seven-event fixture with known-by-hand expected features.
+    """Hand-written events whose correct feature values are known by hand.
 
     Session A (eligible, y=1)
         rn1 view P1 t+0      rn2 view P2 t+30    rn3 view P1 t+60
@@ -83,7 +85,6 @@ def handmade_pipeline(tmp_path_factory):
         )
 
     rows = [
-        # --- Session A ---
         ev("A", 1, 0, "view", 1, 100.0),
         ev("A", 1, 30, "view", 2, 200.0),
         ev("A", 1, 60, "view", 1, 100.0),
@@ -91,17 +92,14 @@ def handmade_pipeline(tmp_path_factory):
         ev("A", 1, 120, "view", 1, 100.0),
         ev("A", 1, 150, "cart", 1, 100.0),
         ev("A", 1, 200, "purchase", 1, 100.0),
-        # --- Session B ---
         ev("B", 2, 0, "view", 10, 50.0),
         ev("B", 2, 10, "view", 11, 60.0),
         ev("B", 2, 20, "view", 12, 70.0),
         ev("B", 2, 30, "view", 13, 80.0),
         ev("B", 2, 40, "view", 14, 90.0),
-        # --- Session C (too short) ---
         ev("C", 3, 0, "view", 20, 20.0),
         ev("C", 3, 5, "view", 21, 25.0),
         ev("C", 3, 9, "view", 22, 30.0),
-        # --- Session D (purchases inside prefix) ---
         ev("D", 4, 0, "view", 30, 15.0),
         ev("D", 4, 5, "view", 31, 18.0),
         ev("D", 4, 10, "purchase", 31, 18.0),
@@ -111,27 +109,29 @@ def handmade_pipeline(tmp_path_factory):
     ]
 
     df = pl.DataFrame(rows).with_columns(pl.col("event_time").dt.date().alias("event_date"))
-    _write_events(settings, df)
+    out = settings.events_dir
+    out.mkdir(parents=True, exist_ok=True)
+    for (d,), part in df.group_by(["event_date"]):
+        pdir = out / f"event_date={d}"
+        pdir.mkdir(parents=True, exist_ok=True)
+        part.drop("event_date").write_parquet(pdir / "part_0.parquet")
+
     _build(settings, k=K)
     return settings
 
 
 @pytest.fixture(scope="session")
-def synthetic_pipeline(tmp_path_factory):
-    """Generated sessions with planted signal, for statistical + leakage checks."""
-    from scripts.make_synthetic_data import generate
+def real_pipeline(tmp_path_factory):
+    """A committed slice of the real archive, run through the full pipeline."""
+    if not FIXTURE_EVENTS.exists() or not any(FIXTURE_EVENTS.rglob("*.parquet")):
+        pytest.skip(
+            f"no real fixture at {FIXTURE_EVENTS}. Build it once with:\n"
+            "    python -m scripts.make_test_fixture"
+        )
 
-    root = tmp_path_factory.mktemp("synthetic")
+    root = tmp_path_factory.mktemp("real")
     settings = _fresh_settings(root)
-    df = generate(
-        n_sessions=4000,
-        start=datetime(2019, 10, 1),
-        days=20,
-        n_users=1500,
-        n_products=400,
-        black_friday_day=18,
-        seed=11,
-    )
-    _write_events(settings, df)
+    settings.events_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(FIXTURE_EVENTS, settings.events_dir)
     _build(settings, k=K)
     return settings

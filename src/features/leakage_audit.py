@@ -76,30 +76,68 @@ def audit(settings, k: int, hard_mode: bool = False, until: str | None = None) -
 
     # Recompute event ranks from first principles, matching the documented
     # ordering (event_time, then product_id as a deterministic tiebreak).
+    #
+    # Restricted to sessions that actually appear in the training table. Ranking
+    # all 110M events is what killed an earlier run: the window function has to
+    # sort the whole archive, and the audited sessions are a small fraction of
+    # it. Narrowing here changes nothing about independence - the ranks are
+    # still derived from raw events, not from the feature builder's output.
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE audited AS SELECT DISTINCT session_key FROM {train}"
+    )
+    # Must apply the same total ordering the definition specifies: exact
+    # duplicate events collapsed, then ordered by (event_time, product_id,
+    # event_type). Ordering by (event_time, product_id) alone leaves ties, and
+    # row_number() over a tied key is arbitrary - which is the bug this audit
+    # found in the first place.
     con.execute(
         f"""
         CREATE OR REPLACE TEMP TABLE ranked AS
-        SELECT user_session AS session_key, event_time, event_type,
-               row_number() OVER (PARTITION BY user_session
-                                  ORDER BY event_time, product_id) AS rn
-        FROM {events}
-        {f"WHERE event_time < TIMESTAMP '{until}'" if until else ""}
+        SELECT session_key, event_time, event_type,
+               row_number() OVER (PARTITION BY session_key
+                                  ORDER BY event_time, product_id, event_type) AS rn
+        FROM (
+            SELECT a.session_key, e.event_time, e.event_type, e.product_id
+            FROM {events} e
+            JOIN audited a ON a.session_key = e.user_session
+            {f"WHERE e.event_time < TIMESTAMP '{until}'" if until else ""}
+            GROUP BY 1, 2, 3, 4
+        )
         """
     )
 
-    # 1. exactly k events at or before the published cutoff
+    # 1. The prefix must be exactly k events, and none of them may postdate the
+    #    published cutoff. Counting purely by `event_time <= cutoff` does NOT
+    #    work: one-second timestamp granularity means events tie, so a session
+    #    can legitimately have more than k events at or before its cutoff. The
+    #    check is therefore on rank, plus the separate guarantee that the
+    #    cutoff really is the last moment the features saw.
     n = con.execute(
         f"""
         SELECT count(*) FROM (
-            SELECT t.session_key, count(*) AS n_at_or_before
+            SELECT t.session_key, count(*) AS n_in_prefix
             FROM {train} t JOIN ranked r USING (session_key)
-            WHERE r.event_time <= t.cutoff_time
+            WHERE r.rn <= {k}
             GROUP BY t.session_key
-        ) WHERE n_at_or_before <> {k}
+        ) WHERE n_in_prefix <> {k}
         """
     ).fetchone()[0]
     res.checks["prefix_size"] = int(n)
     res.details["prefix_size"] = f"sessions whose prefix is not exactly {k} events"
+
+    # 1b. cutoff_time must equal the last event the features actually saw.
+    n = con.execute(
+        f"""
+        SELECT count(*) FROM (
+            SELECT t.session_key, t.cutoff_time, max(r.event_time) AS true_cutoff
+            FROM {train} t JOIN ranked r USING (session_key)
+            WHERE r.rn <= {k}
+            GROUP BY t.session_key, t.cutoff_time
+        ) WHERE cutoff_time <> true_cutoff
+        """
+    ).fetchone()[0]
+    res.checks["cutoff_is_last_seen"] = int(n)
+    res.details["cutoff_is_last_seen"] = "rows whose cutoff_time is not the last prefix event"
 
     # 2. no purchase inside the prefix
     n = con.execute(
@@ -112,12 +150,15 @@ def audit(settings, k: int, hard_mode: bool = False, until: str | None = None) -
     res.checks["no_prepurchase"] = int(n)
     res.details["no_prepurchase"] = "sessions that already purchased before the cutoff"
 
-    # 3. the label comes only from post-cutoff events
+    # 3. The label comes only from events strictly after the cutoff instant.
+    #    Recomputed from the published cutoff_time using nothing but timestamps,
+    #    so this stays independent of how the prefix was ranked.
     n = con.execute(
         f"""
         WITH truth AS (
             SELECT t.session_key,
-                   max(CASE WHEN r.rn > {k} AND r.event_type='purchase' THEN 1 ELSE 0 END) AS y_true
+                   max(CASE WHEN r.event_time > t.cutoff_time AND r.event_type='purchase'
+                            THEN 1 ELSE 0 END) AS y_true
             FROM {train} t JOIN ranked r USING (session_key)
             GROUP BY t.session_key
         )
