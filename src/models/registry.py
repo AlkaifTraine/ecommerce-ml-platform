@@ -47,14 +47,28 @@ class ModelRef:
     alias: str
     run_id: str
     metrics: dict[str, float]
+    # filename inside the reader's own artifacts_dir - see log_run for why the
+    # registry does not store an absolute artifact path
+    model_filename: str = "model_k5.txt"
 
 
 def _mlflow(settings=None):
     import mlflow
 
     settings = settings or get_settings()
-    Path(settings.data_root / "mlartifacts").mkdir(parents=True, exist_ok=True)
+    artifacts = Path(settings.data_root / "mlartifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(settings.mlflow_uri)
+
+    # Pin the artifact root to data/mlartifacts. Without an explicit location
+    # MLflow writes to ./mlruns relative to the process's working directory,
+    # which differs between the host and the Airflow container - the same
+    # experiment then scatters artifacts across two places and serving cannot
+    # find what training wrote.
+    client = mlflow.MlflowClient()
+    exp = client.get_experiment_by_name(settings.mlflow_experiment)
+    if exp is None:
+        client.create_experiment(settings.mlflow_experiment, artifact_location=artifacts.as_uri())
     mlflow.set_experiment(settings.mlflow_experiment)
     return mlflow
 
@@ -89,13 +103,51 @@ def log_run(
 
         version = None
         if register:
-            uri = f"runs:/{run.info.run_id}"
+            # NOT mlflow.register_model(). That requires a "logged model"
+            # created by a flavour's log_model(), and this project stores the
+            # raw LightGBM booster with log_artifact() because serving loads
+            # the booster file directly rather than through pyfunc. Calling
+            # register_model on a run that only has artifacts fails with
+            # "Unable to find a logged_model with artifact_path ..." - which is
+            # exactly how the first orchestrated run died, after training had
+            # already succeeded.
+            #
+            # create_model_version registers a pointer to the artifact instead,
+            # which is what the champion/challenger aliases actually need.
+            client = mlflow.MlflowClient()
+            name = settings.mlflow_model_name
             try:
-                mv = mlflow.register_model(uri, settings.mlflow_model_name)
-                version = mv.version
-                log.info("registered %s version %s", settings.mlflow_model_name, version)
-            except Exception as exc:
-                log.warning("model registration skipped: %s", exc)
+                client.create_registered_model(name)
+                log.info("created registered model %r", name)
+            except Exception:
+                pass  # already exists; the only expected failure here
+
+            # The version's `source` is a LOGICAL path relative to DATA_ROOT,
+            # not run.info.artifact_uri.
+            #
+            # MLflow records an ABSOLUTE artifact location, but the host and
+            # the Airflow container mount the same directory at different
+            # absolute paths (D:\...\data vs /opt/project/data), so no single
+            # file:// URI resolves in both. When the container inherited an
+            # experiment created on the host it wrote the model into a literal
+            # directory named "D:" inside the container, registered a champion
+            # pointing at a path that existed nowhere, and the DAG reported
+            # success. A green pipeline with an unloadable champion.
+            #
+            # Training already writes the booster into settings.artifacts_dir,
+            # which both environments resolve correctly through their own
+            # DATA_ROOT. So the registry holds metadata and the filename; the
+            # file is found relative to whoever is reading.
+            filename = artifacts[0].name if artifacts else "model.txt"
+            mv = client.create_model_version(
+                name=name,
+                source=f"artifacts/{filename}",
+                run_id=run.info.run_id,
+            )
+            version = mv.version
+            client.set_model_version_tag(name, version, "model_filename", filename)
+            log.info("registered %s version %s -> artifacts/%s (resolved per environment)",
+                     name, version, filename)
 
         log.info("logged run %s (id=%s)", run_name, run.info.run_id)
         return version
@@ -112,10 +164,13 @@ def get_by_alias(alias: str, settings=None) -> ModelRef | None:
     run = client.get_run(mv.run_id)
     return ModelRef(
         name=settings.mlflow_model_name,
-        version=mv.version,
+        # MLflow 3 hands back an int here; the dataclass and every consumer
+        # expect a string.
+        version=str(mv.version),
         alias=alias,
         run_id=mv.run_id,
         metrics=dict(run.data.metrics),
+        model_filename=(mv.tags or {}).get("model_filename", "model_k5.txt"),
     )
 
 

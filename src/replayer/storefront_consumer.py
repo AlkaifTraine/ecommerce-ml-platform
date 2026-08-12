@@ -50,7 +50,24 @@ def _stop(signum, frame):  # pragma: no cover - signal path
 
 
 class StorefrontConsumer:
-    def __init__(self, settings, retain_days: int = 7):
+    """Applies replayed events as OLTP transactions.
+
+    NOT IDEMPOTENT ACROSS OVERLAPPING REPLAYS, by design and by necessity.
+    `seq` is assigned from a running counter, so an event delivered twice gets
+    a fresh sequence number and inserts again - measured at 29,693 duplicate
+    (session, time, type, product) groups after a replay was restarted over a
+    window it had already emitted.
+
+    Content-based deduplication cannot fix this: the archive itself contains
+    ~0.2% genuinely-exact duplicate events, so a natural-key unique constraint
+    would reject legitimate rows.
+
+    The correct contract is that replaying means re-running the simulation from
+    a clock position, so the hot window must be cleared first. `--truncate`
+    does that, and `src/replayer/replay.py --reset` should be paired with it.
+    """
+
+    def __init__(self, settings, retain_days: int = 7, truncate: bool = False):
         import redis
 
         self.settings = settings
@@ -60,6 +77,25 @@ class StorefrontConsumer:
         self.retain_days = retain_days
         self._seq_cache: dict[str, int] = {}
         self.applied = 0
+
+        if truncate:
+            self._truncate()
+
+    def _truncate(self) -> None:
+        """Clear the OLTP hot window so a replay starts from a clean slate."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            TRUNCATE storefront.session_events, storefront.cart_items,
+                     storefront.carts, storefront.order_items, storefront.orders,
+                     storefront.sessions, storefront.users, storefront.products
+            RESTART IDENTITY CASCADE
+            """
+        )
+        self.conn.commit()
+        cur.close()
+        self._seq_cache.clear()
+        log.warning("OLTP hot window truncated - replay will repopulate it")
 
         try:
             self.r.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
@@ -330,9 +366,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--batch-size", type=int, default=2000)
     ap.add_argument("--retain-days", type=int, default=7)
+    ap.add_argument("--truncate", action="store_true",
+                    help="clear the OLTP hot window first; pair with a fresh replay")
     args = ap.parse_args()
 
-    c = StorefrontConsumer(settings, retain_days=args.retain_days)
+    c = StorefrontConsumer(settings, retain_days=args.retain_days, truncate=args.truncate)
     try:
         c.run(batch_size=args.batch_size)
     finally:

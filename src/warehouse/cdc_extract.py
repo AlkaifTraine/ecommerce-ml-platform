@@ -85,6 +85,28 @@ def extract(settings, table: str, batch_size: int, lag_seconds: int) -> int:
         clock = cur.fetchone()[0]
         ceiling = clock - timedelta(seconds=lag_seconds)
 
+        # Detect a source reset. If the table's highest id is BELOW the stored
+        # watermark, the source was truncated and its identity restarted - the
+        # watermark now points past the end of a table that begins again at 1,
+        # so every future extract silently returns nothing.
+        #
+        # This is not hypothetical: a scheduled run drained the OLTP store,
+        # the store was then truncated and replayed, and the lake ended up
+        # holding two overlapping id ranges - stale rows and fresh rows with
+        # the same ids, indistinguishable afterwards.
+        cur.execute(f"SELECT max({pk}) FROM storefront.{table}")
+        table_max = cur.fetchone()[0]
+        if table_max is not None and int(table_max) < watermark:
+            conn.rollback()
+            raise SystemExit(
+                f"{table}: source reset detected - max({pk})={table_max} is below the "
+                f"watermark {watermark}. The table was truncated after a previous "
+                f"extract, so the lake holds rows whose ids now refer to different "
+                f"events.\n"
+                f"Resolve deliberately: delete data/parquet/lake/{table}, reset the "
+                f"watermark to 0, and re-extract."
+            )
+
         cur.execute(
             f"""
             SELECT max({pk}) FROM storefront.{table}
@@ -98,7 +120,34 @@ def extract(settings, table: str, batch_size: int, lag_seconds: int) -> int:
             conn.rollback()
             return 0
 
+        # The watermark may only advance to a point where EVERY row at or below
+        # it has already been extracted. Ids are not ordered by event_time here
+        # - the consumer inserts batched by session, not chronologically - so a
+        # low id can carry a timestamp past the ceiling. Advancing to
+        # max(id where ts <= ceiling) then skips those rows permanently.
+        #
+        # Measured: 734 of 421,627 session_events silently lost that way, found
+        # by scripts/verify_lake.py comparing lake rows against source rows at
+        # the watermark. Nothing errored.
+        #
+        # So the ceiling for this batch is one below the FIRST id whose
+        # timestamp exceeds the cutoff - everything under that is safe to take.
+        cur.execute(
+            f"SELECT min({pk}) FROM storefront.{table} WHERE {pk} > %s AND {ts_col} > %s",
+            (watermark, ceiling),
+        )
+        first_excluded = cur.fetchone()[0]
+
         upper = min(int(max_id), watermark + batch_size)
+        if first_excluded is not None:
+            upper = min(upper, int(first_excluded) - 1)
+        if upper <= watermark:
+            log.info(
+                "%s: next row (id %s) is above the safety ceiling %s - waiting",
+                table, first_excluded, ceiling,
+            )
+            conn.rollback()
+            return 0
 
         cur.execute(
             f"""

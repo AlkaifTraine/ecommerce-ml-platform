@@ -96,14 +96,26 @@ def _load_model() -> None:
 
         ref = get_by_alias(CHAMPION, settings)
         if ref is not None:
-            import mlflow
-
-            path = mlflow.artifacts.download_artifacts(
-                run_id=ref.run_id, artifact_path=f"model_k{K}.txt"
-            )
-            STATE.update(model=lgb.Booster(model_file=path),
-                         version=ref.version, source="mlflow:champion")
-            log.info("loaded champion version %s from registry", ref.version)
+            # Resolve the model file through OUR OWN artifacts_dir rather than
+            # downloading the run's artifact URI. MLflow stores an absolute
+            # location, and the host and container mount the same directory at
+            # different absolute paths - downloading by URI gets a path that
+            # exists in the other environment, or nowhere. The registry supplies
+            # the version and the filename; the bytes come from local disk.
+            path = settings.artifacts_dir / ref.model_filename
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"champion version {ref.version} names {ref.model_filename}, "
+                    f"which is not present at {path}"
+                )
+            # str(): MLflow 3 returns ModelVersion.version as an int, while
+            # ScoreResponse.model_version is typed str. Left uncoerced, /model
+            # (an untyped dict) works fine and every /score request fails
+            # pydantic validation with a 500 - so the API looks healthy right
+            # up until it is asked to do its job.
+            STATE.update(model=lgb.Booster(model_file=str(path)),
+                         version=str(ref.version), source="mlflow:champion")
+            log.info("loaded champion version %s from %s", ref.version, path)
             return
     except Exception as exc:
         log.warning("registry unavailable (%s); falling back to local artifact", exc)

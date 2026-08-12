@@ -52,6 +52,13 @@ class RedisStreamSink(EventSink):
     more work per write for no benefit here.
     """
 
+    # Flush every CHUNK commands rather than building one pipeline for the
+    # whole batch. A replay window at high speed can contain a few hundred
+    # thousand events, and a single pipeline that large stalls: redis-py holds
+    # every command in memory and the round trip never completes, so the
+    # producer appears frozen with the clock stuck and events_emitted at zero.
+    CHUNK = 5_000
+
     def __init__(self, url: str, stream: str = STREAM, maxlen: int = 2_000_000):
         import redis
 
@@ -62,6 +69,7 @@ class RedisStreamSink(EventSink):
     def emit(self, events: Iterable[dict[str, Any]]) -> int:
         pipe = self._r.pipeline(transaction=False)
         n = 0
+        pending = 0
         for e in events:
             pipe.xadd(
                 self._stream,
@@ -70,7 +78,12 @@ class RedisStreamSink(EventSink):
                 approximate=True,
             )
             n += 1
-        if n:
+            pending += 1
+            if pending >= self.CHUNK:
+                pipe.execute()
+                pipe = self._r.pipeline(transaction=False)
+                pending = 0
+        if pending:
             pipe.execute()
         return n
 
