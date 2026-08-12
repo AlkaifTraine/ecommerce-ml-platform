@@ -1,12 +1,50 @@
 # Real-Time Purchase-Intent Platform
 
-A continuously-retraining ML platform built on a real e-commerce clickstream.
-It stands inside a live shopping session, predicts whether that session will end
-in a purchase, and keeps itself accurate as shopper behaviour changes.
+A continuously-retraining ML platform on **109,950,743 real e-commerce events**.
+It stands inside a live shopping session, predicts from the first five events
+whether that session ends in a purchase, and keeps itself correct as shopper
+behaviour and the source data change.
 
-> **Status: in progress.** Sections marked _(pending)_ have no measured results
-> yet. No number appears in this README until it has actually been produced by a
-> run against the real dataset.
+### Headline
+
+> From the first 5 events of a session, **49.9% of purchasing sessions are
+> reached by contacting 10% of traffic — 5x better than random.**
+> ROC-AUC **0.8406**, PR-AUC **0.4140** (best heuristic: 0.7147 / 0.232), on a
+> strictly held-out future window, with an automated leakage audit passing all
+> five checks on 5,148,713 training rows.
+
+| | |
+|---|---|
+| Data | 109,950,743 events · 23,016,650 sessions · 5,316,649 users · 206,876 products |
+| Serving | p50 **0.61 ms**, p99 **0.90 ms** |
+| Stack | Postgres (OLTP) · DuckDB + dbt (OLAP) · Airflow · MLflow · Redis Streams · FastAPI · Docker |
+| Tests | 19 passing, incl. leakage audit, determinism, and training/serving parity |
+
+### Three findings that came out of the data, not the plan
+
+1. **The source pipeline had an outage.** 2019-11-15 records zero purchases
+   while 766K sessions browse normally, and the backlog lands on the 17th.
+   Trained as-is, **3.3M sessions would be silently labelled "did not buy"**.
+   Detected, quarantined, and regression-tested.
+2. **The drift is in the label, not the features.** Price PSI peaks at 0.0100
+   against a 0.10 alert level while conversion moves 26.4% against a 25% one.
+   A feature-drift dashboard would have shown green throughout. This is the
+   argument for delayed-label monitoring, measured rather than asserted.
+3. **The pipeline was not reproducible.** Three separate aggregations resolved
+   ties arbitrarily, so rebuilding produced a subtly different training set —
+   which invalidates any comparison between model versions, and is fatal on a
+   platform whose entire premise is retraining and comparing.
+
+Each was found by tooling — the dbt tests, the leakage audit, the feature
+importances — not by reading code.
+
+> **Honesty notes.** Black Friday is a damp squib in this dataset (+13%
+> relative conversion, no discount signature), so the drift story is built on
+> the outage and the label-rate decline instead. Dwell time is
+> *anti*-predictive (AUC 0.4358, below random). Cart-count ranking alone
+> already achieves 4.25x lift, so compare on PR-AUC (0.232 → 0.414, +79%)
+> rather than lift. The event stream is an **event-time replay** of a
+> historical archive, never live traffic.
 
 ---
 
