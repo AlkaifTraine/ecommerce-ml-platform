@@ -5,7 +5,9 @@ ecommerce_platform:
   outputs:
     dev:
       type: duckdb
-      path: 'D:/ecommerce-ml-platform/data/warehouse.duckdb'
+      # WAREHOUSE_PATH is set inside the Airflow container, where the host's
+      # D: path does not exist. Falls back to the host path for local runs.
+      path: "{{ env_var('WAREHOUSE_PATH', 'D:/ecommerce-ml-platform/data/warehouse.duckdb') }}"
       threads: 4
       extensions: []
       settings:

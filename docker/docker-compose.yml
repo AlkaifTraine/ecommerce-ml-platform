@@ -110,11 +110,17 @@ services:
       POSTGRES_PORT: "5432"
       REDIS_URL: redis://redis:6379/0
       PYTHONPATH: /opt/project
+      # dbt's profile reads this; the host path in profiles.yml is a Windows
+      # path that does not exist inside the container.
+      WAREHOUSE_PATH: /opt/project/data/warehouse.duckdb
+      MLFLOW_TRACKING_URI: ""
     volumes:
       - ../dags:/opt/airflow/dags
       - ../src:/opt/project/src
       - ../scripts:/opt/project/scripts
       - ../data:/opt/project/data
+      # required by warehouse_refresh, which runs `dbt build` from here
+      - ../dbt:/opt/project/dbt
       - airflow_logs:/opt/airflow/logs
     command: >
       bash -c "airflow db migrate &&

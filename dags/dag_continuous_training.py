@@ -97,10 +97,20 @@ def continuous_training():
         from src.models.train import run
         from src.platform_core import get_settings
 
+        import math
+
         results = run(K, hard_mode=False, settings=get_settings(), log_mlflow=False)
         test = results["model"].get("test", {})
         print(f"test AUC={test.get('roc_auc'):.4f} lift@10%={test.get('lift_at_10pct'):.2f}x")
-        return {f"test_{k}": v for k, v in test.items()}
+        # Drop non-finite values: metrics can be NaN on a degenerate window
+        # (a split containing a single class has no AUC), and NaN is not valid
+        # JSON, so it fails XCom serialisation with an error that points at
+        # Airflow rather than at the metric.
+        return {
+            f"test_{k}": float(v)
+            for k, v in test.items()
+            if isinstance(v, (int, float)) and math.isfinite(v)
+        }
 
     @task
     def register(metrics: dict) -> str | None:
