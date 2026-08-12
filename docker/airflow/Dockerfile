@@ -23,11 +23,30 @@ ARG PIP_OPTS="--no-cache-dir --timeout 300 --retries 20"
 RUN pip install ${PIP_OPTS} "duckdb>=1.1"
 RUN pip install ${PIP_OPTS} "polars>=1.17"
 RUN pip install ${PIP_OPTS} "pyarrow>=18"
-RUN pip install ${PIP_OPTS} "scikit-learn>=1.5"
-RUN pip install ${PIP_OPTS} "lightgbm>=4.5"
+
+# numpy MUST stay below 2.0 in this image. apache/airflow:2.10.0 ships
+# pandas 2.1.4, which declares numpy<2 and fails at import against numpy 2.x
+# with a binary incompatibility.
+#
+# Pinning numpy in an earlier layer is NOT enough, and that failed here twice.
+# pip resolves each RUN independently, and scikit-learn pulls scipy, whose
+# current release requires numpy>=2 - so numpy came back through a transitive
+# dependency even with an explicit "numpy<2" installed first. scipy has to be
+# capped as well, and the three installed together so the resolver sees all
+# the constraints at once.
+RUN pip install ${PIP_OPTS} \
+        "numpy<2" \
+        "scipy<1.14" \
+        "scikit-learn>=1.5,<1.6" \
+        "lightgbm>=4.5,<4.7"
 RUN pip install ${PIP_OPTS} "mlflow-skinny>=2.19"
 RUN pip install ${PIP_OPTS} "redis>=5.0" "pydantic-settings>=2.7"
 RUN pip install ${PIP_OPTS} "dbt-core>=1.9" "dbt-duckdb>=1.9"
+
+# Build-time smoke test - see smoke_test.py for why this is a build layer and
+# not something checked at runtime.
+COPY smoke_test.py /tmp/smoke_test.py
+RUN python /tmp/smoke_test.py
 
 # Code is bind-mounted at /opt/project rather than copied, so a code change
 # does not require an image rebuild.
