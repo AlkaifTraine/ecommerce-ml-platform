@@ -20,6 +20,11 @@ behaviour and the source data change.
 | Stack | Postgres (OLTP) · DuckDB + dbt (OLAP) · Airflow · MLflow · Redis Streams · FastAPI · Docker |
 | Tests | 19 passing, incl. leakage audit, determinism, and training/serving parity |
 
+Everything above is measured from a run against the full dataset. AWS is
+designed and costed in [`infra/AWS_DEPLOYMENT.md`](infra/AWS_DEPLOYMENT.md)
+but **deliberately not deployed**, so no "deployed on AWS" claim appears
+anywhere in this repository.
+
 ### Three findings that came out of the data, not the plan
 
 1. **The source pipeline had an outage.** 2019-11-15 records zero purchases
@@ -169,17 +174,100 @@ src/
   platform_core/     config and logging; every path resolves through here
   ingest/            Kaggle download, CSV→Parquet, data profiling
   features/          sessionisation, truncation-point features, leakage audit
-  models/            training, business-facing metrics
+  models/            training, business metrics, MLflow registry + promotion
   replayer/          the clock, event sinks, replay engine, OLTP consumer
-  serving/           scoring API                                    (pending)
-  monitoring/        drift detection and auto-promotion             (pending)
-  warehouse/         CDC extract and warehouse loading              (pending)
-dags/                Airflow DAGs                                   (pending)
-dbt/                 warehouse models                               (pending)
-docker/              compose stack + OLTP schema
-tests/               feature correctness and leakage guarantees
-scripts/             synthetic data, environment helpers
+  serving/           FastAPI scoring service + online feature computation
+  monitoring/        drift detection (covariate / label / data-quality)
+  warehouse/         CDC extract with safety lag, star-schema builder
+dags/                three Airflow DAGs (training, drift, warehouse refresh)
+dbt/                 marts and 24 data-quality tests
+docker/              compose stack, OLTP schema, Airflow image + smoke test
+infra/               AWS deployment design, costed and NOT deployed
+tests/               19 tests: features, leakage, determinism, serving parity
+scripts/             gates, audits, fixtures, the incident figure
+reports/figures/     drift_incident.png
 ```
+
+## Running it
+
+```bash
+# services - everything this project owns is prefixed ecomml-
+cd docker && docker compose up -d                    # postgres + redis
+cd docker && docker compose --profile airflow up -d  # + airflow on :8080
+
+docker ps --filter "name=ecomml-"
+
+# pipeline
+python -m src.features.sessionize
+python -m src.features.build_features --k 5
+python -m src.features.leakage_audit --k 5           # hard gate
+python -m src.models.train --k 5
+
+# warehouse and marts
+python -m src.warehouse.build_warehouse
+cd dbt && dbt build --profiles-dir .
+
+# serving (8500, since 8000 may be taken locally)
+python -m uvicorn src.serving.api:app --port 8500
+python -m scripts.score_demo
+
+# monitoring
+python -m src.monitoring.drift --as-of 2019-11-17
+python -m scripts.make_incident_chart
+
+python -m pytest -q
+```
+
+### Orchestration, verified
+
+`drift_monitor` run against the archive with the replay clock at 2019-11-17:
+
+```
+run_check            success   31.5s over 109,950,743 events
+route_on_verdict     success   "Branch into quarantine_and_hold"
+trigger_retrain      skipped
+recalibrate          skipped
+no_action            skipped
+quarantine_and_hold  failed    <- intended
+```
+
+The final `failed` is the designed outcome. A data-quality incident must stop
+the pipeline loudly; a green DAG there would mean the platform had quietly
+retrained on days whose labels are unknowable.
+
+What makes this run the whole argument in miniature: the monitor saw a label
+shift of **-1.7%** and a price PSI of **0.0060** — both of which look
+perfectly healthy — and refused to retrain anyway, because the data-quality
+signal found zero purchases on 2019-11-15 and volume at 2.1x–4.5x across
+11-14..17. A monitor watching drift alone would have retrained into four days
+of corrupted labels.
+
+> **dbt does not run inside the Airflow container**, and its task skips with an
+> explanation rather than failing, so a green DAG never implies dbt ran.
+> `dbt-core` requires `protobuf>=5` while the `opentelemetry-proto` Airflow
+> ships requires `protobuf<5` — no pin satisfies both. Separately, DuckDB
+> permits one writing process, so the container and the host cannot both hold
+> the warehouse open. In cloud, dbt gets its own image via
+> `KubernetesPodOperator`, which is the standard pattern regardless.
+
+## Six guards, one theme
+
+Every guard here exists because something looked fine and was not. None of
+these failures announce themselves.
+
+| Guard | Silent failure it catches |
+|---|---|
+| `features/leakage_audit.py` | model trained on data it could not have seen |
+| `test_feature_build_is_deterministic` | training set changes between identical builds |
+| `test_serving_parity.py` | serving features drift from training features |
+| `docker/airflow/smoke_test.py` | pip reports success, import fails at runtime |
+| `scripts/data_quality_audit.py` | source pipeline breaks, labels become fiction |
+| `quarantine_and_hold` branch | drift monitor retrains on corrupted data |
+
+The audit is written from the task definition rather than by reusing the
+feature builder's SQL — deliberately, because shared code would have made both
+sides agree on the same bug. It found a real one: a non-total ordering that
+made the training set irreproducible.
 
 ---
 
