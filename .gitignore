@@ -47,3 +47,6 @@ airflow/plugins/__pycache__/
 # os
 Thumbs.db
 .DS_Store
+
+# generated from docs/PROJECT_REFERENCE.md via scripts/md_to_pdf.py
+docs/*.pdf
