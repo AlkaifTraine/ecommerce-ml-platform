@@ -106,8 +106,15 @@ services:
       DATA_ROOT: /opt/project/data
       DUCKDB_TEMP_DIR: /opt/project/data/.duckdb_tmp
       DUCKDB_MEMORY_LIMIT: 2GB
+      # All four are required. .env is NOT mounted into this container, so
+      # anything omitted here silently falls back to the placeholder defaults
+      # in config.py - which is how the first DAG run failed with
+      # "password authentication failed for user storefront".
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-storefront}
+      POSTGRES_USER: ${POSTGRES_USER:-storefront}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-storefront_local}
       REDIS_URL: redis://redis:6379/0
       PYTHONPATH: /opt/project
       # dbt's profile reads this; the host path in profiles.yml is a Windows

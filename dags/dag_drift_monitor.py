@@ -49,37 +49,71 @@ DEFAULT_ARGS = {
 def drift_monitor():
 
     @task
-    def run_check(**context) -> dict:
+    def run_check() -> dict:
+        # NO `**context` here, and that is not cosmetic. Declaring it makes
+        # TaskFlow pass the entire Airflow context (dag, dag_run, ti, task) as
+        # op_kwargs. Those objects reference one another circularly, and
+        # Airflow's secrets masker walks op_kwargs whenever it logs - so any
+        # log line sends _redact into unbounded recursion. The task then dies
+        # with RecursionError and NO traceback, because the recursion eats the
+        # stack before the real error can be written. The underlying task body
+        # runs fine standalone, which is what makes it so misleading.
+        import traceback
+
         import psycopg2
 
         from src.monitoring.drift import check
         from src.platform_core import get_settings
 
-        settings = get_settings()
-        conn = psycopg2.connect(settings.postgres_dsn)
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT current_data_time FROM storefront.replay_clock WHERE id = 1")
-            clock = cur.fetchone()[0]
-            cur.close()
-        finally:
-            conn.close()
+            settings = get_settings()
+            conn = psycopg2.connect(settings.postgres_dsn)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT current_data_time FROM storefront.replay_clock WHERE id = 1")
+                clock = cur.fetchone()[0]
+                cur.close()
+            finally:
+                conn.close()
+            as_of = clock.date().isoformat()
+            rep = check(settings, as_of=as_of)
+        except Exception as exc:
+            # Print a truncated traceback ourselves and re-raise something
+            # small. Letting a large exception propagate into Airflow's logger
+            # is what triggers the masker recursion described above, which
+            # replaces the real error with RecursionError.
+            for line in traceback.format_exc().splitlines()[-12:]:
+                print(line[:200])
+            raise RuntimeError(f"{type(exc).__name__}: {str(exc)[:200]}") from None
 
-        as_of = clock.date().isoformat()
-        rep = check(settings, as_of=as_of)
-        print(rep.to_json())
+        # Deliberately NOT `print(rep.to_json())`. Airflow redirects task stdout
+        # through its logger, where the secrets masker walks the string, hits
+        # its recursion limit on a large blob, and logs a warning that re-enters
+        # the same handler - the task then dies with RecursionError and no
+        # traceback in the task log. (It survives `airflow tasks test`, which
+        # does not install that redirect, so the bug only appears once the
+        # scheduler runs it.) Short lines only; the full report goes to a file.
+        print(f"as_of={as_of} verdict={rep.verdict} action={rep.action}")
+        print(f"label_rate={rep.label_rate:.5f} baseline={rep.label_baseline:.5f} "
+              f"shift={rep.label_shift_rel:+.3f}")
+        for name, value in rep.feature_psi.items():
+            print(f"psi[{name}]={value:.4f}")
+        for reason in rep.reasons[:8]:
+            print(f"reason: {reason[:180]}")
 
         out = settings.artifacts_dir / f"drift_{as_of}.json"
         out.write_text(rep.to_json(), encoding="utf-8")
+        print(f"full report written to {out}")
+
         return {"verdict": rep.verdict, "action": rep.action, "as_of": as_of,
-                "reasons": rep.reasons}
+                "reasons": [r[:180] for r in rep.reasons[:8]]}
 
     def _route(ti=None, **_) -> str:
         rep = ti.xcom_pull(task_ids="run_check")
         action = rep["action"]
         print(f"verdict={rep['verdict']} action={action}")
-        for r in rep["reasons"]:
-            print(f"  - {r}")
+        for r in rep["reasons"][:6]:
+            print(f"  - {r[:180]}")
         return {
             "retrain": "trigger_retrain",
             "recalibrate": "recalibrate",

@@ -41,7 +41,35 @@ RUN pip install ${PIP_OPTS} \
         "lightgbm>=4.5,<4.7"
 RUN pip install ${PIP_OPTS} "mlflow-skinny>=2.19"
 RUN pip install ${PIP_OPTS} "redis>=5.0" "pydantic-settings>=2.7"
-RUN pip install ${PIP_OPTS} "dbt-core>=1.9" "dbt-duckdb>=1.9"
+
+# dbt is deliberately NOT installed here, and no pin can fix it:
+#
+#   dbt-core                      requires protobuf >= 5
+#   opentelemetry-proto 1.26.0    requires protobuf <  5   (shipped by Airflow)
+#
+# Those are mutually exclusive. Installing dbt anyway pulled protobuf 6.33.6
+# and broke opentelemetry plus ~20 google-cloud-* packages that Airflow ships.
+#
+# Putting dbt in its own image is the standard production answer regardless -
+# Airflow orchestrates it via KubernetesPodOperator / ECSOperator rather than
+# importing it in-process. See dags/dag_warehouse_refresh.py for how the dbt
+# step is handled here, and README "Warehouse and dbt" for the second reason
+# (DuckDB permits only one writing process, so Airflow and the host cannot
+# both hold the warehouse open read-write).
+
+# LightGBM links against the OpenMP runtime, which the slim Airflow image does
+# not carry. pip installs the wheel happily and reports success; the failure is
+# `OSError: libgomp.so.1: cannot open shared object file` at import time, i.e.
+# inside every training task, not at build time. The smoke test below caught
+# exactly this.
+#
+# Placed AFTER the pip layers on purpose: putting an apt layer near the top
+# would invalidate ~130MB of cached wheels on a ~100 KB/s link.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+USER airflow
 
 # Build-time smoke test - see smoke_test.py for why this is a build layer and
 # not something checked at runtime.

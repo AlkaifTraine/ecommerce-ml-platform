@@ -20,7 +20,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
-from airflow.operators.bash import BashOperator
 
 DEFAULT_ARGS = {
     "owner": "data-platform",
@@ -68,17 +67,49 @@ def warehouse_refresh():
 
         build(get_settings())
 
-    dbt_build = BashOperator(
-        task_id="dbt_build",
-        # `dbt build` runs models and their tests together and stops a
-        # downstream model from being built on a failed upstream test.
-        bash_command=(
-            "cd /opt/project/dbt && "
-            "dbt build --profiles-dir . --no-partial-parse"
-        ),
-    )
+    @task
+    def dbt_build() -> str:
+        """Run `dbt build` if dbt is present; skip loudly if it is not.
 
-    build_warehouse(cdc_extract()) >> dbt_build
+        dbt is deliberately absent from this image. Two independent reasons:
+
+        1. dbt-core requires protobuf>=5 while the opentelemetry-proto that
+           Airflow 2.10 ships requires protobuf<5. No pin satisfies both;
+           installing dbt anyway broke OpenTelemetry and ~20 google-cloud
+           packages.
+        2. DuckDB permits a single writing process. If this container held
+           warehouse.duckdb open read-write, nothing on the host could write
+           to it, and vice versa.
+
+        The production answer to both is the same and is what a cloud deploy
+        would do: run dbt in its own image via KubernetesPodOperator or
+        ECSOperator. Locally it runs on the host. This task therefore SKIPS
+        rather than fails, so a green DAG never implies dbt ran when it did
+        not.
+        """
+        import shutil
+        import subprocess
+
+        from airflow.exceptions import AirflowSkipException
+
+        if shutil.which("dbt") is None:
+            raise AirflowSkipException(
+                "dbt is not installed in this image by design (protobuf conflict "
+                "with Airflow's opentelemetry, and DuckDB's single-writer limit). "
+                "Run it on the host:  cd dbt && dbt build --profiles-dir ."
+            )
+
+        proc = subprocess.run(
+            ["dbt", "build", "--profiles-dir", ".", "--no-partial-parse"],
+            cwd="/opt/project/dbt", capture_output=True, text=True,
+        )
+        print(proc.stdout[-4000:])
+        if proc.returncode != 0:
+            print(proc.stderr[-2000:])
+            raise RuntimeError(f"dbt build failed with exit {proc.returncode}")
+        return "dbt build passed"
+
+    build_warehouse(cdc_extract()) >> dbt_build()
 
 
 warehouse_refresh()
