@@ -220,7 +220,52 @@ python -m pytest -q
 
 ### Orchestration, verified
 
-`drift_monitor` run against the archive with the replay clock at 2019-11-17:
+Every DAG has been executed against the real archive. Nothing below is
+described as working on the strength of the code alone.
+
+**`continuous_training`** — all six tasks green:
+
+```
+read_clock       success
+build_features   success   ~7 min, 4,495,843 eligible sessions, clock-bounded
+leakage_audit    success   6/6 checks, 0 violations
+train            success   test ROC-AUC 0.8423
+register         success   purchase_intent version 1
+promote          success   "no incumbent champion; promoting on test_roc_auc=0.8423"
+```
+
+Promotion is never automatic on completion: the model is registered as
+`challenger` and takes `champion` only after an explicit decision.
+
+**`warehouse_refresh`** — `cdc_extract` (7s) → `build_warehouse` (85s) →
+`dbt_build` **skipped** with its explanation. Lake verified afterwards:
+
+```
+session_events   lake=418,637  distinct=418,637  ids=1..418637  watermark=418637  OK
+orders           lake=  6,741  distinct=  6,741  ids=1..6741    watermark=6741    OK
+```
+
+Contiguous ids with matching counts: every row below the watermark present
+exactly once.
+
+**Replay → OLTP**, reconciled against the archive over the replayed window:
+
+| metric | archive | oltp | delta |
+|---|---|---|---|
+| events | 428,668 | 428,668 | 0 |
+| sessions | 101,379 | 101,379 | 0 |
+| users | 75,997 | 75,997 | 0 |
+| purchasing sessions | 6,114 | 6,114 | 0 |
+| duplicate groups | 367 | 367 | 0 |
+
+**Serving loads the champion from the registry** — `{"version":"1",
+"source":"mlflow:champion","num_trees":296}`. The 296 trees confirm it is the
+DAG-trained model rather than the local artifact, so promotion genuinely
+reaches serving. Scoring 85 real sessions: p50 **0.56 ms**, p99 **3.71 ms**,
+buyers averaging 0.1271 against 0.0637 for non-buyers.
+
+**`drift_monitor`, proven in both directions.** On the outage window
+(clock 2019-11-17):
 
 ```
 run_check            success   31.5s over 109,950,743 events
@@ -230,6 +275,14 @@ recalibrate          skipped
 no_action            skipped
 quarantine_and_hold  failed    <- intended
 ```
+
+On a clean window (clock 2019-11-28) the same DAG routes to `no_action` and
+finishes green. A monitor that is always red is an alarm nobody reads.
+
+> The 7-day lookback means an incident keeps firing for a week after the source
+> recovers, because the window still contains the bad days. That is correct —
+> you should not retrain on a window containing corrupted labels — but it is
+> worth knowing before someone asks why it is still red.
 
 The final `failed` is the designed outcome. A data-quality incident must stop
 the pipeline loudly; a green DAG there would mean the platform had quietly
@@ -263,6 +316,20 @@ these failures announce themselves.
 | `docker/airflow/smoke_test.py` | pip reports success, import fails at runtime |
 | `scripts/data_quality_audit.py` | source pipeline breaks, labels become fiction |
 | `quarantine_and_hold` branch | drift monitor retrains on corrupted data |
+| `scripts/verify_lake.py` | CDC skips rows and advances past them anyway |
+| `scripts/reconcile_window.py` | replay writes a different dataset than the source |
+
+`verify_lake.py` earned its place immediately: it found that `cdc_extract` had
+silently dropped **734 of 421,627 events** and moved its watermark past them.
+Both DAG tasks had reported success. The lake is the durable record — Postgres
+keeps only a 7-day window — so those rows would have been unrecoverable.
+
+Two guards produced a **false positive** on first contact with real data, and
+both were fixed rather than ignored: the buy/cart data-quality rule flagged
+every weekend, and the reconciliation check asserted zero duplicate events when
+the archive genuinely contains ~0.2% exact duplicates that a faithful replay
+must reproduce. A guard that flags correct behaviour is worse than no guard,
+because it teaches you to ignore it.
 
 The audit is written from the task definition rather than by reusing the
 feature builder's SQL — deliberately, because shared code would have made both
