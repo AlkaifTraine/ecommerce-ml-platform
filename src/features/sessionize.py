@@ -63,7 +63,16 @@ def build(settings, rederive: bool = False, until: str | None = None) -> int:
             )
         """
     else:
-        session_key = f"SELECT *, user_session AS session_key FROM {src} {time_filter}"
+        # 12 events in the archive carry a NULL user_session - all cart events,
+        # belonging to 12 unrelated users. GROUP BY collapses them into one
+        # phantom session containing twelve strangers. They never reached the
+        # training table, but only because `e.user_session = c.session_key` is
+        # never true for NULL, which is luck rather than a control. Excluded
+        # explicitly here so the session index, the warehouse and dim_user are
+        # all clean at the source.
+        null_filter = "user_session IS NOT NULL"
+        where = f"{time_filter} AND {null_filter}" if time_filter else f"WHERE {null_filter}"
+        session_key = f"SELECT *, user_session AS session_key FROM {src} {where}"
 
     out = settings.features_dir / "sessions.parquet"
     log.info("building session index -> %s", out)
@@ -75,7 +84,14 @@ def build(settings, rederive: bool = False, until: str | None = None) -> int:
             sess AS (
                 SELECT
                     session_key,
-                    any_value(user_id)                                     AS user_id,
+                    -- min(), not any_value(): 939 sessions (0.004%) contain
+                    -- events from more than one user_id - one spans three
+                    -- users across 43 events. Ownership is genuinely ambiguous
+                    -- there, but any_value() resolves it ARBITRARILY, so the
+                    -- session-to-user mapping could change between runs and
+                    -- take the point-in-time history features with it. min()
+                    -- is equally arbitrary but reproducible.
+                    min(user_id)                                           AS user_id,
                     min(event_time)                                        AS session_start,
                     max(event_time)                                        AS session_end,
                     count(*)                                               AS n_events,

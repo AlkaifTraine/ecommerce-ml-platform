@@ -42,7 +42,14 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # ---- tracking ----
-    mlflow_tracking_uri: str = "http://localhost:5000"
+    # Empty means "derive a SQLite path under data_root" (see mlflow_uri). The
+    # registry needs a database-backed store - a plain file:// store supports
+    # tracking but NOT model versions or aliases, which the champion/challenger
+    # promotion flow depends on. SQLite gives us that with no server to run and
+    # no container image to pull.
+    mlflow_tracking_uri: str = ""
+    mlflow_experiment: str = "session_purchase_intent"
+    mlflow_model_name: str = "purchase_intent"
 
     # ---- replayer ----
     replay_speed: float = 100_000.0
@@ -91,6 +98,17 @@ class Settings(BaseSettings):
     def events_dir(self) -> Path:
         """Partitioned event-level parquet - the immutable source of truth."""
         return self.parquet_dir / "events"
+
+    @property
+    def mlflow_uri(self) -> str:
+        if self.mlflow_tracking_uri:
+            return self.mlflow_tracking_uri
+        db = (self.data_root / "mlflow.db").as_posix()
+        return f"sqlite:///{db}"
+
+    @property
+    def mlflow_artifacts(self) -> str:
+        return (self.data_root / "mlartifacts").as_uri()
 
     @property
     def postgres_dsn(self) -> str:

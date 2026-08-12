@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: mart_daily_conversion
+    description: >
+      Daily conversion against a trailing 7-day baseline that excludes the
+      current day and any quarantined day. Feeds the drift monitor.
+    columns:
+      - name: date_key
+        tests: [not_null, unique]
+      - name: conv_pct
+        tests: [not_null]
+      - name: data_quality_flag
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['OK', 'NO_PURCHASES', 'VOLUME_ANOMALY', 'CONVERSION_SHIFT']
+
+  - name: mart_user_segments
+    description: RFM segmentation over full user history.
+    columns:
+      - name: user_id
+        tests: [not_null, unique]
+      - name: segment
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - browser_casual
+                  - browser_engaged
+                  - one_time_buyer
+                  - repeat_buyer
+                  - champion
+                  - at_risk_valuable
+      - name: r_score
+        tests:
+          - accepted_values:
+              arguments:
+                values: [1, 2, 3, 4, 5]

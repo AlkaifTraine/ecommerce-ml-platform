@@ -1,0 +1,46 @@
+version: 2
+
+sources:
+  - name: warehouse
+    description: >
+      Base star schema built by src/warehouse/build_warehouse.py from the
+      Parquet archive. dbt treats these as sources rather than models because
+      building them needs memory tuning that dbt does not express well.
+    schema: main
+    tables:
+      - name: dim_date
+        columns:
+          - name: date_key
+            tests: [not_null, unique]
+      - name: dim_product
+        columns:
+          - name: product_id
+            tests: [not_null, unique]
+      - name: dim_user
+        columns:
+          - name: user_id
+            tests: [not_null, unique]
+      - name: fct_session
+        description: One row per visit - the grain everything downstream uses.
+        columns:
+          - name: session_key
+            tests: [not_null, unique]
+          - name: user_id
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('warehouse', 'dim_user')
+                    field: user_id
+          - name: bought
+            tests:
+              - accepted_values:
+                  arguments:
+                    values: [0, 1]
+          - name: n_events
+            tests: [not_null]
+      - name: agg_daily
+        columns:
+          - name: date_key
+            tests: [not_null, unique]
+      - name: agg_category_daily

@@ -1,0 +1,18 @@
+# Kept in the project directory rather than ~/.dbt so the repo is
+# self-contained. Run dbt with:  dbt run --profiles-dir .
+ecommerce_platform:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: 'D:/ecommerce-ml-platform/data/warehouse.duckdb'
+      threads: 4
+      extensions: []
+      settings:
+        # temp_directory is deliberately NOT set here. DuckDB raises
+        # "Cannot switch temporary directory after the current one has been
+        # used" when dbt re-applies settings on an already-active connection,
+        # which fails the run after the tests have passed. The default temp
+        # location sits beside the database file on D:, which is what we want
+        # anyway.
+        memory_limit: '3GB'

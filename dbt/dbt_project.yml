@@ -1,0 +1,26 @@
+name: 'ecommerce_platform'
+version: '1.0.0'
+config-version: 2
+
+profile: 'ecommerce_platform'
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# The base star schema (dim_*, fct_session, agg_*) is built by
+# src/warehouse/build_warehouse.py, which is tuned to stay inside a 4GB memory
+# budget while scanning 110M events. dbt owns the layer above that: derived
+# marts and, more importantly, the tests that assert the warehouse is sane.
+models:
+  ecommerce_platform:
+    marts:
+      +materialized: table
+      +schema: marts
+
+vars:
+  # Days the source pipeline lost purchase events. Any mart that feeds
+  # modelling or monitoring must exclude them.
+  quarantine_dates: ['2019-11-14', '2019-11-15', '2019-11-16', '2019-11-17']

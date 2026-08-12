@@ -335,10 +335,72 @@ months — which is what `--hard-mode` exists to test.
 
 ---
 
+## Warehouse and dbt
+
+The base star schema is built by `src/warehouse/build_warehouse.py` (55s, 2.3GB
+DuckDB file) rather than by dbt, because scanning 110M events inside a 4GB
+memory budget needs tuning that dbt does not express well. dbt owns the layer
+above it — derived marts and, more importantly, the tests.
+
+| Table | Rows |
+|---|---|
+| `dim_date` | 61 |
+| `dim_product` | 206,876 |
+| `dim_user` | 5,316,115 |
+| `fct_session` | 23,016,650 |
+| `agg_daily` | 61 |
+| `agg_category_daily` | 854 |
+
+```bash
+python -m src.warehouse.build_warehouse
+cd dbt && dbt build --profiles-dir .        # 2 models, 24 tests
+python -m scripts.warehouse_demo            # queries Postgres cannot answer
+```
+
+Questions the warehouse answers that the OLTP store structurally cannot, since
+it retains only seven days:
+
+* conversion by half-month — **8.08% → 7.93% → 5.97% → 6.21%**, a 26% relative
+  decline, while average price barely moves
+* the 2019-11-14..17 outage, in a single query, with quarantine flags joined
+  from `dim_date`
+* **256,958 repeat buyers — 37% of all buyers — generate 73.8% of revenue**
+
+### Determinism
+
+Three separate places resolved ties *arbitrarily*, which meant rebuilding the
+pipeline could produce a different answer:
+
+| Location | Arbitrary choice | Fix |
+|---|---|---|
+| `row_number()` over `(event_time, product_id)` | which event is k-th | dedupe, then order by `(event_time, product_id, event_type)` |
+| `any_value(user_id)` per session | who owns a multi-user session | `min(user_id)` |
+| `any_value(category_code)` per product | a product's category | `min(...)` |
+
+Individually these touch 1 row, 939 sessions and a handful of products — none
+would move a metric. Collectively they meant "rebuild" and "get the same
+answer" were different things, which invalidates any A/B comparison between
+model versions. On a platform whose premise is continuous retraining, that is
+the difference between measuring improvement and measuring build noise.
+`tests/test_features.py::test_feature_build_is_deterministic` guards the first.
+
 ## Known limitations
 
 Stated up front because they will come up in any serious conversation about
 this project:
+
+- **939 sessions (0.004%) contain events from more than one `user_id`**, one of
+  them spanning three users across 43 events. Ownership is genuinely ambiguous;
+  they are attributed to `min(user_id)` — equally arbitrary but reproducible.
+  109 of them reach the training table. A consequence: 534 users appear *only*
+  as the non-minimum party in such sessions and therefore own no session, which
+  is why `dim_user` holds 5,316,115 rows against 5,316,649 distinct user ids in
+  the raw archive.
+- **12 events carry a NULL `user_session`** — all cart events, from 12
+  unrelated users. `GROUP BY` merged them into one phantom session containing
+  twelve strangers. They never reached training, but only because `NULL = NULL`
+  is never true in a join, which is luck rather than a control. Now excluded
+  explicitly in `sessionize.py`.
 
 - **No treatment data.** The dataset records what shoppers did, not what the
   store did to them. That supports purchase *propensity* but not *uplift*
