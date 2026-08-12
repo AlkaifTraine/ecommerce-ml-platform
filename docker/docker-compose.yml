@@ -1,16 +1,19 @@
-# Local platform stack.
+# Local platform stack for the e-commerce purchase-intent project.
 #
-# Default `docker compose up -d` starts only the two lightweight services the
-# pipeline actually needs (Postgres + Redis, ~300MB of images). Everything
-# heavier sits behind a profile because this machine has limited free space on
-# C:, where Docker Desktop keeps its WSL disk image.
+# NAMING: every container this project owns is prefixed `ecomml-`, so it is
+# unambiguous which containers belong here versus to anything else running on
+# the machine. Volumes and the network are prefixed `ecomml_` via the project
+# name below.
 #
-#   docker compose up -d                        # postgres + redis
-#   docker compose --profile tools   up -d      # + adminer (DB browser)
-#   docker compose --profile mlflow  up -d      # + MLflow tracking server
-#   docker compose --profile kafka   up -d      # + Kafka, swapping out Redis Streams
+#   docker compose up -d                      # ecomml-postgres + ecomml-redis
+#   docker compose --profile airflow up -d    # + ecomml-airflow (orchestration)
+#   docker compose --profile tools   up -d    # + ecomml-adminer (DB browser)
+#   docker compose --profile kafka   up -d    # + ecomml-kafka (swaps Redis Streams)
 #
-# Postgres is on 5433, not 5432, to avoid colliding with any local install.
+# See what belongs to this project at any time:
+#   docker ps --filter "name=ecomml-"
+#
+# Postgres is on 5433 to avoid colliding with any other local install.
 
 name: ecommerce-ml-platform
 
@@ -19,13 +22,12 @@ services:
     # postgres:16 (not -alpine) because that tag is already present locally and
     # this machine has ~100 KB/s of bandwidth; pulling a new image costs an hour.
     image: postgres:16
-    container_name: emp-postgres
+    container_name: ecomml-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-storefront}
       POSTGRES_USER: ${POSTGRES_USER:-storefront}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-storefront_local}
-      # deterministic collation so ORDER BY matches DuckDB's
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
     ports:
       - "5433:5432"
@@ -33,14 +35,14 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
     # Tuned for a write-heavy replay on a 16GB laptop. synchronous_commit=off
-    # trades crash durability for throughput, which is the right call here:
-    # the archive is the source of truth and a replay can simply be re-run.
+    # trades crash durability for throughput, which is the right call here: the
+    # archive is the source of truth and a replay can simply be re-run.
     command: >
       postgres
-      -c shared_buffers=512MB
-      -c work_mem=32MB
-      -c maintenance_work_mem=256MB
-      -c max_connections=50
+      -c shared_buffers=384MB
+      -c work_mem=24MB
+      -c maintenance_work_mem=192MB
+      -c max_connections=60
       -c synchronous_commit=off
       -c wal_compression=on
       -c checkpoint_timeout=15min
@@ -54,9 +56,8 @@ services:
       start_period: 20s
 
   redis:
-    # likewise already present locally
     image: redis:latest
-    container_name: emp-redis
+    container_name: ecomml-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
@@ -64,7 +65,7 @@ services:
     # replay cannot consume the host; allkeys-lru evicts cold feature keys.
     command: >
       redis-server
-      --maxmemory 1gb
+      --maxmemory 768mb
       --maxmemory-policy allkeys-lru
       --appendonly no
       --save ""
@@ -76,9 +77,59 @@ services:
       timeout: 3s
       retries: 10
 
+  airflow:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    image: ecomml-airflow:2.10.0
+    container_name: ecomml-airflow
+    restart: unless-stopped
+    profiles: ["airflow"]
+    ports:
+      - "8080:8080"
+    environment:
+      # LocalExecutor in ONE container rather than the usual webserver +
+      # scheduler + triggerer + its own Postgres. That standard topology wants
+      # ~2.5GB; this machine has ~4GB free with everything else stopped.
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${POSTGRES_USER:-storefront}:${POSTGRES_PASSWORD:-storefront_local}@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__PARALLELISM: "2"
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW__WEBSERVER__SECRET_KEY: local_dev_not_a_secret
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      # The pipeline reads its paths from these, same as on the host.
+      DATA_ROOT: /opt/project/data
+      DUCKDB_TEMP_DIR: /opt/project/data/.duckdb_tmp
+      DUCKDB_MEMORY_LIMIT: 2GB
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      PYTHONPATH: /opt/project
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../src:/opt/project/src
+      - ../scripts:/opt/project/scripts
+      - ../data:/opt/project/data
+      - airflow_logs:/opt/airflow/logs
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --password admin
+                 --firstname a --lastname b --role Admin --email admin@example.com || true &&
+               airflow scheduler & exec airflow webserver"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   adminer:
     image: adminer:4-standalone
-    container_name: emp-adminer
+    container_name: ecomml-adminer
     restart: unless-stopped
     profiles: ["tools"]
     ports:
@@ -89,32 +140,9 @@ services:
       postgres:
         condition: service_healthy
 
-  mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.19.0
-    container_name: emp-mlflow
-    restart: unless-stopped
-    profiles: ["mlflow"]
-    ports:
-      - "5000:5000"
-    environment:
-      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-storefront}:${POSTGRES_PASSWORD:-storefront_local}@postgres:5432/${POSTGRES_DB:-storefront}
-      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlartifacts
-    # psycopg2 is not in the base image; install it before the server starts.
-    command: >
-      bash -c "pip install --no-cache-dir psycopg2-binary &&
-               mlflow server
-                 --host 0.0.0.0 --port 5000
-                 --backend-store-uri $$MLFLOW_BACKEND_STORE_URI
-                 --default-artifact-root $$MLFLOW_DEFAULT_ARTIFACT_ROOT"
-    volumes:
-      - mlartifacts:/mlartifacts
-    depends_on:
-      postgres:
-        condition: service_healthy
-
   kafka:
     image: bitnami/kafka:3.9
-    container_name: emp-kafka
+    container_name: ecomml-kafka
     restart: unless-stopped
     profiles: ["kafka"]
     ports:
@@ -137,5 +165,5 @@ services:
 volumes:
   pgdata:
   redisdata:
-  mlartifacts:
+  airflow_logs:
   kafkadata:
