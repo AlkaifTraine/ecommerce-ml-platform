@@ -1,33 +1,35 @@
 # Airflow image with this project's runtime dependencies.
 #
-# The stock apache/airflow image cannot run our pipeline - it has pandas and
-# numpy but not duckdb, polars, lightgbm or scikit-learn. Rather than shell out
-# to the host (impossible from a container) the tasks run in-process here, so
-# the image needs the same libraries the pipeline uses.
+# The stock apache/airflow image has pandas and numpy but not duckdb, polars,
+# lightgbm or scikit-learn, so the pipeline cannot run in it as shipped.
 #
-# Base tag is pinned to 2.10.0 because that image is ALREADY present on this
-# machine. Pulling a different tag would mean ~2GB over a ~100 KB/s link.
+# Base tag pinned to 2.10.0 because that image is ALREADY present on this
+# machine. Any other tag is a ~2GB pull over a ~100 KB/s link.
 #
-# The extra wheels are ~150MB and are the only download this build needs.
+# ONE PACKAGE PER LAYER, deliberately. This link times out partway through
+# large wheels and pip cannot resume, so a single combined RUN meant a failure
+# on the 57MB polars wheel threw away the 21.5MB duckdb wheel that had already
+# downloaded. With separate layers Docker caches each success and a rebuild
+# resumes at the first failure. The long --timeout and --retries matter for the
+# same reason.
 
 FROM apache/airflow:2.10.0
 
 USER airflow
 
-# Airflow pins its own dependency tree tightly; installing without care breaks
-# it. None of these are Airflow dependencies, so they can be added directly -
-# but they are installed in one layer so a retry does not redo the whole set.
-RUN pip install --no-cache-dir \
-        "duckdb>=1.1" \
-        "polars>=1.17" \
-        "lightgbm>=4.5" \
-        "scikit-learn>=1.5" \
-        "pyarrow>=18" \
-        "redis>=5.0" \
-        "mlflow-skinny>=2.19" \
-        "pydantic-settings>=2.7"
+ARG PIP_OPTS="--no-cache-dir --timeout 300 --retries 20"
 
-# Our code is bind-mounted at /opt/project rather than copied, so a code change
+# Heaviest first, each isolated so its layer is cached on success.
+RUN pip install ${PIP_OPTS} "duckdb>=1.1"
+RUN pip install ${PIP_OPTS} "polars>=1.17"
+RUN pip install ${PIP_OPTS} "pyarrow>=18"
+RUN pip install ${PIP_OPTS} "scikit-learn>=1.5"
+RUN pip install ${PIP_OPTS} "lightgbm>=4.5"
+RUN pip install ${PIP_OPTS} "mlflow-skinny>=2.19"
+RUN pip install ${PIP_OPTS} "redis>=5.0" "pydantic-settings>=2.7"
+RUN pip install ${PIP_OPTS} "dbt-core>=1.9" "dbt-duckdb>=1.9"
+
+# Code is bind-mounted at /opt/project rather than copied, so a code change
 # does not require an image rebuild.
 ENV PYTHONPATH=/opt/project
 WORKDIR /opt/project
