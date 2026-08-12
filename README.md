@@ -294,6 +294,13 @@ contributing real signal rather than leaking current-session outcomes.
 
 ### Where the drift actually is
 
+![Feature drift stays flat while the label rate breaches its alert level](reports/figures/drift_incident.png)
+
+Reproduce with `python -m scripts.make_incident_chart`. Measured weekly against
+a fixed October reference: price PSI peaks at **0.0100** against a 0.10 alert
+level, while the conversion shift reaches **26.4%** against a 25% alert level.
+Feature drift never gets within a tenth of firing; label drift breaches.
+
 | Signal | PSI (Oct vs late Nov) | Verdict |
 |---|---|---|
 | price | 0.0024 | no shift |

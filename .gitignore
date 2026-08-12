@@ -25,8 +25,12 @@ kaggle.json
 # mlflow / artifacts
 mlruns/
 mlartifacts/
+
+# Generated figures are ignored by default - they are reproducible from
+# scripts/ - EXCEPT the headline figure, which is referenced by the README and
+# is the one artefact a reader looks at before any code.
 reports/figures/*.png
-!reports/figures/.gitkeep
+!reports/figures/drift_incident.png
 
 # dbt
 dbt/target/
