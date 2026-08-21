@@ -11,6 +11,10 @@ questions about the project.
 **Status:** complete; all components executed and verified against real data.
 **Not deployed to cloud** — AWS is designed and costed only (see §12).
 
+> **Resuming work in a new session? Read §16 first.** It records exactly what
+> exists on disk, what is running, the traps that will bite again, and the open
+> items in rough order of value.
+
 Every number in this document was measured by running the code. Nothing is
 estimated. Where something is unverified or uncertain, it says so.
 
@@ -317,9 +321,21 @@ re-run), `shared_buffers=384MB`, `wal_compression=on`.
 ### 4.4 Event bus — Redis Streams
 
 An append-only log with consumer groups and offsets; maps to Kinesis on AWS.
-Kafka is a swap-in backend behind the same `EventSink` interface, enabled by a
-docker-compose profile. Redis was chosen locally because it needs no
-KRaft/ZooKeeper and the image is small.
+Redis was chosen locally because it needs no KRaft/ZooKeeper and the image is
+small, and because there is exactly **one** consumer — so Kafka's real
+advantages (multiple independent consumer groups, replay from arbitrary
+offsets, partitioned horizontal scale, replication) do not apply.
+
+**Honesty note.** A `KafkaSink` exists in `src/replayer/sinks.py` behind the
+same `EventSink` interface, and a `kafka` docker-compose profile exists — but
+**`kafka-python` is not installed and that code path has never executed once.**
+Redis Streams is what actually ran. Do not claim Kafka experience from this
+project; claim the trade-off reasoning instead, which is the better answer
+anyway.
+
+**When Kafka becomes correct here:** a second consumer needs the same stream, or
+you need to replay from an offset rather than from the archive, or one broker
+stops being enough.
 
 ### 4.5 OLAP — DuckDB star schema + dbt
 
@@ -404,6 +420,9 @@ production model constantly — it looks like progress and is not.
 
 - Serves whichever version holds `champion`; `/reload` picks up promotion or
   rollback without a redeploy.
+- **Looks user history up from the online feature store** (§4.11) rather than
+  expecting the caller to supply it. Returns `history_source` on every response
+  so the provenance of a score is visible.
 - Falls back to the local artifact when the registry is unreachable — refusing
   to serve because a tracking server is down would make monitoring a hard
   dependency of the storefront.
@@ -415,6 +434,42 @@ production model constantly — it looks like progress and is not.
   prefix — the training eligibility rule enforced at serving time.
 - `scored_at_data_time` is the replay clock, not wall time, so monitoring joins
   line up with the simulated calendar.
+
+### 4.11 Online feature store
+
+`src/serving/feature_store.py`. Two-tier, the standard shape:
+
+```
+offline   warehouse dim_user (full 61-day history)
+              |  materialise on a schedule
+              v
+online    Redis hash per user (feat:user:{id}), O(1) at serving time
+              |  fallback on miss
+              v
+          Postgres storefront.users (7-day hot window only — DEGRADED)
+```
+
+**5,316,115 users materialised**, occupying ~732MB of Redis's 768MB cap.
+
+**Materialisation reads the warehouse, not Postgres**, because the OLTP store
+keeps only a 7-day hot window — using it would hand serving a truncated history
+that training never saw, which is training/serving skew by construction.
+
+**`found` and `source` are returned explicitly.** This is the whole point: the
+API must distinguish "this user genuinely has no history", where zeros are
+CORRECT, from "the store was unreachable", where zeros are a silent lie.
+Conflating those caused the bug in §8.19. When the store is unavailable the API
+returns **503** rather than quietly serving a worse prediction.
+
+**Known limitation — eviction.** 5.3M hashes nearly fill the cap, so
+`allkeys-lru` will evict cold users. That is acceptable for a cache with a
+fallback, but the Postgres fallback is degraded (7 days only), so an evicted
+user gets different history than training saw. In production you size the store
+to the working set, or use DynamoDB, which does not evict.
+
+**Staleness.** Online values are as of the last materialisation, so they exclude
+the in-flight session. That is inherent to every online store and bounded by the
+materialisation schedule; it is not the same as being wrong.
 
 ### 4.10 Training/serving parity
 
@@ -913,6 +968,38 @@ legitimate rows.
 window must be cleared first. Now a `--truncate` flag with the reasoning in the
 class docstring.
 
+### 8.19 Serving scored every user as brand new
+`ScoreRequest` declared `prior_sessions` / `prior_purchases` / `prior_revenue`
+with **default 0**, and the API never looked them up. `scripts/score_demo.py`
+did not send them, so **every session ever scored was treated as a brand-new
+user with no history** — while `user_prior_conv_rate` is the **second most
+important feature by gain (513,033)**.
+
+**Why the parity test missed it.** `test_serving_parity.py` passes history in
+explicitly, so it verified that the **computation** matches training — not that
+production **supplies** the inputs. Two different guarantees; only one was
+being checked. A parity test proves your two implementations agree; it says
+nothing about whether the caller populates them.
+
+**Measured impact**, identical 85 sessions:
+
+| | Before | After |
+|---|---|---|
+| mean score, actually bought | 0.1271 | **0.2739** |
+| mean score, did not buy | 0.0637 | 0.0691 |
+| **separation** | +0.0634 | **+0.2048** |
+
+**3.2× better separation.** The model had been running with its second-strongest
+feature pinned at zero.
+
+**Fix:** the online feature store (§4.11), plus request fields defaulting to
+`None` so "caller did not supply" is distinguishable from "caller supplied
+zero", plus `history_source` on every response.
+
+**How it was found:** not by a test. By someone asking *"where are we physically
+storing our features?"* — a question about architecture that turned out to be a
+question about correctness.
+
 ---
 
 ## 9. TESTING — 19 tests, and the reasoning
@@ -1039,10 +1126,15 @@ artifact (309 trees)** — proof that promotion reaches serving.
 Scoring 85 real sessions: **p50 0.56 ms, p95 0.61 ms, p99 3.71 ms.**
 An earlier run over 104 requests: p50 0.61 ms, p95 0.75 ms, **p99 0.90 ms**.
 
-Separation on real sessions with known outcomes:
-- mean score, actually bought: **0.1271** (n=35)
-- mean score, did not buy: **0.0637** (n=50)
-- separation **+0.0634** — buyers score ~2× higher
+Separation on real sessions with known outcomes, **after** the online feature
+store was added (§4.11 / §8.19):
+- mean score, actually bought: **0.2739** (n=35)
+- mean score, did not buy: **0.0691** (n=50)
+- separation **+0.2048** — buyers score ~4× higher
+
+Before the fix, with user history silently defaulted to zero, the same 85
+sessions gave 0.1271 / 0.0637 and a separation of only +0.0634. Latency p50
+moved 0.56ms → 1.45ms to pay for the Redis lookup.
 
 ### `drift_monitor` — proven in BOTH directions
 
@@ -1116,6 +1208,7 @@ src/
     drift.py         covariate / label / data-quality signals
   serving/
     features_online.py Python twin of the training SQL
+    feature_store.py online store: warehouse -> Redis -> Postgres fallback
     api.py           FastAPI scoring service
 
 dags/
@@ -1146,6 +1239,7 @@ scripts/
   registry_status.py           what is in MLflow right now
   warehouse_demo.py            queries Postgres cannot answer
   score_demo.py                scores real sessions, measures latency
+  md_to_pdf.py                 renders this document to PDF
   fetch_wheels.ps1             resumable wheel downloads
 
 tests/                         19 tests
@@ -1217,6 +1311,14 @@ State these before being asked.
 7. **Cart features are not comparable across months** (§7.3); `--hard-mode`
    quantifies the dependence.
 
+8. **The online feature store can evict.** 5.3M user hashes nearly fill Redis's
+   768MB cap, so `allkeys-lru` drops cold users; the Postgres fallback only sees
+   7 days, so an evicted user is scored with a shorter history than training
+   saw. Production sizes the store to the working set or uses DynamoDB.
+
+9. **Kafka is unverified.** `KafkaSink` exists but `kafka-python` is not
+   installed and the path has never run (§4.4). Redis Streams is what executed.
+
 ---
 
 ## 14. ENVIRONMENT CONSTRAINTS (context for odd decisions)
@@ -1277,6 +1379,11 @@ python -m src.replayer.replay --sink redis --clock postgres \
 python -m scripts.reconcile_window --from "2019-11-24 00:00:00" \
                                    --to   "2019-11-25 00:00:00"
 
+# online feature store — MUST be materialised before serving, or every
+# request is scored as a brand-new user (see 8.19)
+python -m src.serving.feature_store --materialize
+python -m src.serving.feature_store --probe 520088904
+
 # serving (port 8500; 8000 may be taken locally)
 python -m uvicorn src.serving.api:app --port 8500
 python -m scripts.score_demo
@@ -1292,7 +1399,112 @@ python -m pytest -q
 
 ---
 
-## 16. THE THROUGH-LINE
+## 16. CURRENT STATE — READ THIS FIRST IN A NEW SESSION
+
+Everything below was true at the last commit. Verify rather than assume: the
+platform runs on a laptop, so containers may be stopped and the machine may have
+slept.
+
+### What exists and is verified
+
+| Component | State |
+|---|---|
+| Archive | `data/parquet/events/` — 109,950,743 events, 61 date partitions, 1.9 GB |
+| Session index | `data/features/sessions.parquet` — 869 MB |
+| Training table | `data/features/train_k5.parquet` — 328 MB (also `train_k5_hard.parquet`, 367 MB) |
+| Warehouse | `data/warehouse.duckdb` — star schema, ~2.3 GB |
+| CDC lake | `data/parquet/lake/` — session_events, orders, predictions |
+| MLflow | `data/mlflow.db` — `purchase_intent` **version 1**, aliases `champion` and `challenger` both → v1 |
+| Model artifact | `data/artifacts/model_k5.txt` — 296 trees, 32 features |
+| Online store | Redis `feat:user:*` — 5,316,115 users materialised |
+| Replay clock | last set to **2019-11-28** (a clean window) |
+| OLTP | populated from a clean 8-hour replay of 2019-11-24 (428,668 events) |
+| Tests | **19 passing** |
+| dbt | **26/26** |
+
+### Containers and processes
+
+```bash
+docker ps --filter "name=ecomml-"      # ecomml-postgres :5433, ecomml-redis :6379, ecomml-airflow :8080
+```
+
+The serving API runs on the **host**, not in a container, on port **8500**
+(8000 is occupied by an unrelated `business-intelligence` service on this
+machine). It is started manually and does not survive a reboot:
+
+```bash
+python -m uvicorn src.serving.api:app --port 8500
+```
+
+**Airflow DAG state:** `drift_monitor` is unpaused and runs **hourly**, scanning
+110M events each time (~30s). `continuous_training` and `warehouse_refresh` are
+unpaused but scheduled infrequently. Pause them if the machine is needed for
+anything else:
+
+```bash
+docker exec ecomml-airflow airflow dags pause drift_monitor
+```
+
+### To bring everything back up
+
+```bash
+cd docker && docker compose --profile airflow up -d
+cd .. && python -m uvicorn src.serving.api:app --port 8500 &
+python -m src.serving.feature_store --materialize     # if Redis was wiped
+python -m pytest -q                                    # expect 19 passed
+```
+
+Redis has `--save ""` and `--appendonly no`, so **the online store and the event
+stream do not survive a container restart** — re-materialise after any restart.
+That is deliberate (both are derived data) but it will surprise you once.
+
+### Traps that will bite again
+
+1. **Unpausing a cron DAG fires it immediately** for the most recent missed
+   interval. This once raced a truncate and contaminated the CDC lake.
+2. **Replay is not idempotent.** Always run the consumer with `--truncate`
+   before a replay, or you get duplicate events (§8.18).
+3. **The drift monitor's 7-day lookback** keeps an incident firing for a week
+   after the source recovers. At clock = 2019-11-24 the window still contains
+   the 11-17 outage, so it correctly quarantines. Use clock ≥ 2019-11-25 for a
+   clean window.
+4. **DuckDB permits one writer.** Nothing else may hold `warehouse.duckdb` open
+   read-write while `build_warehouse` or dbt runs.
+5. **~100 KB/s to PyPI.** Any new dependency is slow; check whether Python 3.13
+   system site-packages already has it before installing.
+6. **The machine sleeping kills background jobs.** A 9-hour gap once ate a
+   feature build.
+
+### Open items, roughly by value
+
+1. **Re-run `continuous_training` end to end** now that the online store exists,
+   so the registered model and the serving path are verified together in one
+   run. The current champion predates the feature-store fix; nothing is wrong
+   with it, but the two have not been exercised in a single pass.
+2. **Add a test that catches §8.19's class of bug** — assert that a `/score`
+   request *without* history fields returns `history_source != "absent"` for a
+   user known to have history. The parity test cannot catch this by design.
+3. **Verify or delete the Kafka sink.** It has never run. Either install
+   `kafka-python`, bring up the `kafka` profile and test it, or remove the code
+   so the repo does not imply capability it lacks.
+4. **Feast or an equivalent feature registry**, if you want the feature store to
+   be more than a hand-rolled cache.
+5. **Counterfactual evaluation (IPS)** for the ranking side — the honest fix for
+   the bias noted in §13.
+6. **AWS deploy** (§12) if a live URL is wanted. ~$24/month optimised. Adds no
+   technical claim, only a demo link.
+
+### Things NOT to do
+
+- Do **not** claim AWS deployment, Kafka experience, or a live URL.
+- Do **not** re-add synthetic data. Tests run on a committed real slice plus a
+  21-event hand-written fixture, deliberately (§9).
+- Do **not** quote the old serving separation of +0.0634; it is +0.2048 since
+  the feature-store fix.
+
+---
+
+## 17. THE THROUGH-LINE
 
 If there is one thing to take from this project, it is that **the failures that
 matter are silent.**
