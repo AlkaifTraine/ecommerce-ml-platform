@@ -61,8 +61,16 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
-    # Event bus + online feature store. maxmemory caps the stream so a long
-    # replay cannot consume the host; allkeys-lru evicts cold feature keys.
+    # Two roles: the event bus (events.raw stream) and the online feature
+    # store (feat:user:* hashes, materialised from the warehouse by
+    # src/serving/feature_store.py).
+    #
+    # 5.3M user hashes occupy ~732MB of the 768MB cap, so allkeys-lru WILL
+    # evict cold users under pressure. That is deliberate - Redis is a cache
+    # here, and src/serving/feature_store.py falls back to Postgres on a miss.
+    # The fallback is degraded (Postgres holds only the 7-day hot window), so
+    # in production this store is sized to hold the working set, or moved to
+    # DynamoDB which does not evict.
     command: >
       redis-server
       --maxmemory 768mb

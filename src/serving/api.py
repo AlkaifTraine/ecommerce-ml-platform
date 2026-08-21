@@ -32,7 +32,8 @@ from src.serving.features_online import UserHistory, compute, to_vector
 log = get_logger(__name__)
 
 K = 5
-STATE: dict[str, Any] = {"model": None, "version": "unloaded", "source": "none"}
+STATE: dict[str, Any] = {"model": None, "version": "unloaded", "source": "none",
+                         "store": None}
 
 
 # --------------------------------------------------------------------------
@@ -52,9 +53,14 @@ class ScoreRequest(BaseModel):
     session_key: str
     user_id: int
     events: list[Event]
-    prior_sessions: int = 0
-    prior_purchases: int = 0
-    prior_revenue: float = 0.0
+    # History is LOOKED UP from the online store by default. These stay None so
+    # "caller did not supply it" is distinguishable from "caller supplied zero".
+    # They previously defaulted to 0 and were never looked up, which meant every
+    # request was scored as a brand-new user while user_prior_conv_rate is the
+    # second most important feature in the model.
+    prior_sessions: int | None = None
+    prior_purchases: int | None = None
+    prior_revenue: float | None = None
     hours_since_last_session: float | None = None
 
 
@@ -66,6 +72,8 @@ class ScoreResponse(BaseModel):
     latency_ms: float
     decision: str
     reason: str
+    # where the user history came from: redis | postgres | absent | request
+    history_source: str
 
 
 # --------------------------------------------------------------------------
@@ -130,8 +138,13 @@ def _load_model() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from src.serving.feature_store import OnlineFeatureStore
+
     _load_model()
+    STATE["store"] = OnlineFeatureStore(get_settings())
     yield
+    if STATE.get("store") is not None:
+        STATE["store"].close()
     STATE["model"] = None
 
 
@@ -226,16 +239,37 @@ def score(req: ScoreRequest) -> ScoreResponse:
         raise HTTPException(503, "no model loaded")
 
     t0 = time.perf_counter()
+
+    # Resolve user history: an explicit override in the request wins, otherwise
+    # look it up in the online store. Previously these fields defaulted to zero
+    # and were never looked up, so every session was scored as a new user.
+    if req.prior_sessions is not None:
+        history = UserHistory(
+            prior_sessions=req.prior_sessions,
+            prior_purchases=req.prior_purchases or 0,
+            prior_revenue=req.prior_revenue or 0.0,
+            hours_since_last_session=req.hours_since_last_session,
+        )
+        history_source = "request"
+    else:
+        result = STATE["store"].get(req.user_id)
+        history = result.history
+        history.hours_since_last_session = req.hours_since_last_session
+        history_source = result.source
+        if result.source == "unavailable":
+            # Zeros here would be indistinguishable from a genuine new user and
+            # would silently degrade the model's second-strongest feature. Fail
+            # instead of quietly serving a worse prediction.
+            raise HTTPException(
+                503, "online feature store unavailable - refusing to score with "
+                     "unknown user history"
+            )
+
     try:
         feats = compute(
             events=[e.model_dump() for e in req.events],
             k=K,
-            history=UserHistory(
-                prior_sessions=req.prior_sessions,
-                prior_purchases=req.prior_purchases,
-                prior_revenue=req.prior_revenue,
-                hours_since_last_session=req.hours_since_last_session,
-            ),
+            history=history,
         )
     except ValueError as exc:
         # Not an error: the session is simply not scoreable yet.
@@ -255,4 +289,5 @@ def score(req: ScoreRequest) -> ScoreResponse:
         latency_ms=round(latency_ms, 3),
         decision=decision,
         reason=reason,
+        history_source=history_source,
     )
